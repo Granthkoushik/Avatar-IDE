@@ -1,0 +1,37 @@
+@echo off
+
+cd /d "C:\Mini Projects\Avatar_coding"
+
+echo ====================================================
+
+echo Preparing to run app.html...
+
+echo This script requires external dependencies. Installing them first...
+
+echo Running command: Double-click app.html to open in any web browser
+
+echo ====================================================
+
+Double-click app.html to open in any web browser > run_output.log 2>&1
+
+type run_output.log
+
+if %ERRORLEVEL% neq 0 (
+
+    echo.
+
+    echo ====================================================
+
+    echo [AVATAR] Execution failed! Reporting crash to AI...
+
+    echo ====================================================
+
+    powershell -Command "$err = Get-Content -Raw run_output.log; Invoke-RestMethod -Uri 'http://127.0.0.1:8000/api/report_error' -Method Post -Body (ConvertTo-Json @{ filename='app.html'; error=$err }) -ContentType 'application/json'"
+
+) else (
+
+    del run_output.log
+
+)
+
+pause

@@ -1,0 +1,94 @@
+# AVATAR
+
+AVATAR is a lightweight, local-first AI engineering assistant for pasted-code review, runtime-risk detection, repair, chat debugging, and browser voice activation.
+
+It is intentionally not a full IDE. It does not scan folders, save files, overwrite code, or require filesystem permissions.
+
+## Folder Structure
+
+```text
+.
+|-- app/
+|   |-- main.py                 # FastAPI routes, streaming repair, streaming chat
+|   |-- schemas.py              # Request/response models
+|   `-- services/
+|       |-- analyzer.py         # Layered syntax/static/security/runtime analysis
+|       |-- diagnostics.py      # Shared diagnostic models
+|       |-- language.py         # Language detection
+|       |-- tooling.py          # Optional pylint/pyflakes/bandit/eslint adapters
+|       `-- ollama.py           # Ollama model listing and generation helpers
+|-- static/
+|   |-- index.html              # Browser UI shell
+|   |-- styles.css              # Futuristic AVATAR interface styling
+|   `-- app.js                  # Monaco, diagnostics, diff, chat, voice commands
+|-- requirements.txt
+|-- package.json                # Optional JS/HTML/CSS diagnostic tools
+`-- README.md
+```
+
+## Features
+
+- Monaco editor with inline diagnostics, gutter markers, hover explanations, and line jumps
+- Layered analysis pipeline:
+  - language detection
+  - syntax parsing
+  - static analysis
+  - security analysis
+  - runtime risk detection
+  - optional professional tooling
+  - Ollama LLM reasoning merge
+- Runtime safety detection for missing request timeouts, unsafe JSON parsing, unsafe indexing, possible NoneType access, bad async patterns, and API validation risks
+- Streaming repair mode with raw-code-only output rules
+- Professional diff viewer for original vs repaired code
+- AI chat box for debugging, stack traces, concepts, warnings, selected code, and runtime errors
+- Continuous browser voice activation with waveform indicator
+- Voice commands:
+  - "Avatar fix this code"
+  - "Avatar explain this"
+  - "Avatar solve this error"
+  - "Avatar optimize this"
+  - "Avatar find runtime bugs"
+
+## Setup
+
+1. Install Python 3.11+.
+2. Install Ollama and pull at least one coding model:
+
+```powershell
+ollama pull qwen2.5-coder
+ollama pull deepseek-coder
+ollama pull codellama
+```
+
+3. Create a virtual environment and install Python dependencies:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+4. Optional: install local JS/HTML/CSS diagnostic tools:
+
+```powershell
+npm install
+```
+
+5. Run AVATAR:
+
+```powershell
+uvicorn app.main:app --reload
+```
+
+6. Open:
+
+```text
+http://127.0.0.1:8000
+```
+
+## Notes
+
+- Monaco is loaded from a CDN, so the first browser load needs internet access.
+- Ollama must be running locally on `http://localhost:11434` for full AI review, repair, and chat.
+- If Ollama is offline, AVATAR still runs layered local diagnostics and lightweight repair fallback.
+- The chat and voice tools only use pasted/selected browser text. AVATAR does not read or modify local project files.

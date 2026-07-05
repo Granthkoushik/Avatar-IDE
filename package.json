@@ -1,0 +1,22 @@
+{
+  "name": "avatar-ai-coding-workspace",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional local lint tooling for AVATAR diagnostics.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint:js": "eslint static/app.js",
+    "format:check": "prettier --check static"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0",
+    "eslint": "^9.18.0",
+    "prettier": "^3.4.2",
+    "htmlhint": "^1.1.4",
+    "stylelint": "^16.12.0",
+    "stylelint-config-standard": "^36.0.1",
+    "typescript-eslint": "^8.20.0"
+  }
+}
