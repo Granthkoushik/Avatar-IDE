@@ -4,3 +4,12 @@ __pycache__/
 *.py[cod]
 .env
 .DS_Store
+node_modules/
+build/
+dist/
+.ruff_cache/
+*.db
+*.sqlite3
+*.log
+projects/
+scratch/

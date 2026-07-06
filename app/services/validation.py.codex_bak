@@ -1,0 +1,10 @@
+from fastapi import HTTPException
+
+
+def validate_path(path: str) -> None:
+    """Validate that a given relative path is within the workspace and does not contain traversal.
+    Raises HTTPException 400 if invalid.
+    """
+    if not path or ".." in path.replace("\\", "/"):
+        raise HTTPException(status_code=400, detail="Invalid path: traversal not allowed")
+    # Additional checks can be added here (e.g., forbidden filenames)

@@ -1,0 +1,377 @@
+from __future__ import annotations
+
+import ast
+import re
+
+from app.services.diagnostics import (
+    AnalysisContext,
+    Diagnostic,
+    dedupe_diagnostics,
+    estimate_fix_time,
+    overall_severity,
+)
+from app.services.language import detect_language
+from app.services.tooling import run_node_tools, run_python_tools
+
+
+def analyze_code(code: str, selected_language: str = "auto") -> dict:
+    language = detect_language(code, selected_language)
+    ctx = AnalysisContext(code=code, language=language)
+
+    ctx.stage("[ok] Language detection complete.")
+    syntax_analysis(ctx)
+    static_analysis(ctx)
+    security_analysis(ctx)
+    runtime_risk_analysis(ctx)
+    external_tool_analysis(ctx)
+
+    ctx.diagnostics = dedupe_diagnostics(ctx.diagnostics)
+    issues = [item.to_dict() for item in ctx.diagnostics]
+    return {
+        "summary": "PROJECT ANALYSIS COMPLETE",
+        "issue_count": len(issues),
+        "confidence": confidence_score(ctx),
+        "estimated_fix_time": estimate_fix_time(len(issues), code),
+        "severity": overall_severity(issues),
+        "affected_sections": sorted({issue["section"] for issue in issues}) or ["none"],
+        "issues": issues,
+        "language": language,
+        "tool_status": [status.to_dict() for status in ctx.tool_status],
+        "pipeline": ctx.pipeline,
+    }
+
+
+def syntax_analysis(ctx: AnalysisContext) -> None:
+    ctx.stage("[ok] Running syntax parsing...")
+    if ctx.language == "python":
+        try:
+            ast.parse(ctx.code)
+        except SyntaxError as exc:
+            ctx.add(
+                Diagnostic(
+                    "Python syntax error",
+                    "critical",
+                    "syntax",
+                    exc.msg,
+                    exc.lineno or 1,
+                    exc.offset or 1,
+                    section=f"line {exc.lineno or 1}",
+                    source="ast",
+                    fix_hint="Fix the syntax token before running deeper analysis.",
+                )
+            )
+    elif ctx.language == "json":
+        from app.services.tooling import run_node_tools
+
+        diagnostics, statuses = run_node_tools(ctx.code, "json")
+        ctx.diagnostics.extend(diagnostics)
+        ctx.tool_status.extend(statuses)
+
+
+def static_analysis(ctx: AnalysisContext) -> None:
+    ctx.stage("[ok] Running static analysis...")
+    lines = ctx.code.splitlines()
+    duplicate_counts: dict[str, int] = {}
+    for line in lines:
+        stripped = line.strip()
+        if len(stripped) > 34:
+            duplicate_counts[stripped] = duplicate_counts.get(stripped, 0) + 1
+    for duplicated, count in duplicate_counts.items():
+        if count > 1:
+            line_no = next((index + 1 for index, line in enumerate(lines) if line.strip() == duplicated), 1)
+            ctx.add(
+                Diagnostic(
+                    "Duplicate logic detected",
+                    "medium",
+                    "logic",
+                    f"This statement appears {count} times and may hide inconsistent behavior.",
+                    line_no,
+                    1,
+                    section=f"line {line_no}",
+                    source="avatar-static",
+                    fix_hint="Extract the repeated logic into a small helper or consolidate the branches.",
+                )
+            )
+            break
+
+    for index, line in enumerate(lines, start=1):
+        lowered = line.lower()
+        if "todo" in lowered or "fixme" in lowered:
+            ctx.add(
+                Diagnostic(
+                    "Unresolved implementation note",
+                    "low",
+                    "style",
+                    "TODO/FIXME markers often indicate unfinished behavior.",
+                    index,
+                    max(1, lowered.find("todo") + 1 if "todo" in lowered else lowered.find("fixme") + 1),
+                    section=f"line {index}",
+                    source="avatar-static",
+                    fix_hint="Resolve the note or convert it into a tracked task before shipping.",
+                )
+            )
+
+
+def security_analysis(ctx: AnalysisContext) -> None:
+    ctx.stage("[ok] Running security analysis...")
+    patterns = [
+        (r"\beval\s*\(", "Use of eval", "critical", "security", "eval can execute attacker-controlled code.", "Replace eval with a parser or explicit dispatch table."),
+        (r"\bexec\s*\(", "Use of exec", "critical", "security", "exec can execute arbitrary code.", "Remove exec or strictly validate the executed input."),
+        (r"innerHTML\s*=", "Direct innerHTML assignment", "high", "security", "Direct HTML injection can create XSS vulnerabilities.", "Use textContent or sanitize HTML before insertion."),
+        (r"SELECT\s+.*\+|query\s*\(.*\+", "Possible SQL injection", "critical", "security", "String-built SQL can expose injection vulnerabilities.", "Use parameterized queries."),
+        (r"(password|api[_-]?key|secret)\s*=\s*['\"]", "Hard-coded secret", "high", "security", "Secrets should not live in source code.", "Move secrets into environment variables or a secret manager."),
+        (r"verify\s*=\s*False", "TLS verification disabled", "critical", "security", "Disabling TLS verification exposes requests to interception.", "Keep certificate verification enabled."),
+    ]
+    for pattern, title, severity, category, detail, hint in patterns:
+        for match in re.finditer(pattern, ctx.code, flags=re.IGNORECASE | re.DOTALL):
+            line, column = offset_to_line_column(ctx.code, match.start())
+            ctx.add(Diagnostic(title, severity, category, detail, line, column, section=f"line {line}", source="avatar-security", fix_hint=hint))
+
+
+def runtime_risk_analysis(ctx: AnalysisContext) -> None:
+    ctx.stage("[ok] Detecting runtime risks...")
+    if ctx.language == "python":
+        python_runtime_risks(ctx)
+    elif ctx.language in {"javascript", "typescript"}:
+        js_runtime_risks(ctx)
+    elif ctx.language == "html":
+        html_risks(ctx)
+    elif ctx.language == "css":
+        css_risks(ctx)
+
+
+def python_runtime_risks(ctx: AnalysisContext) -> None:
+    try:
+        tree = ast.parse(ctx.code)
+    except SyntaxError:
+        return
+
+    assigned_from_optional_calls: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            call_name = dotted_name(node.value.func)
+            if call_name.endswith((".get", ".json")) or call_name in {"requests.get", "requests.post", "httpx.get", "httpx.post"}:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        assigned_from_optional_calls.add(target.id)
+
+        if isinstance(node, ast.Call):
+            call_name = dotted_name(node.func)
+            if call_name in {"requests.get", "requests.post", "requests.put", "requests.delete", "httpx.get", "httpx.post"}:
+                if not any(keyword.arg == "timeout" for keyword in node.keywords):
+                    ctx.add(
+                        Diagnostic(
+                            "HTTP request missing timeout",
+                            "high",
+                            "runtime",
+                            "A request without a timeout can hang indefinitely and freeze the workflow.",
+                            node.lineno,
+                            node.col_offset + 1,
+                            section=f"line {node.lineno}",
+                            source="avatar-runtime",
+                            fix_hint="Pass a timeout and handle request exceptions.",
+                        )
+                    )
+
+            if call_name.endswith(".json") and not inside_try(tree, node):
+                ctx.add(
+                    Diagnostic(
+                        "Unvalidated JSON response parsing",
+                        "high",
+                        "runtime",
+                        "response.json() can raise when the response is not valid JSON.",
+                        node.lineno,
+                        node.col_offset + 1,
+                        section=f"line {node.lineno}",
+                        source="avatar-runtime",
+                        fix_hint="Wrap JSON parsing in try/except and validate response status first.",
+                    )
+                )
+
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id in assigned_from_optional_calls and not guarded_by_if(tree, node, node.value.id):
+                ctx.add(
+                    Diagnostic(
+                        "Possible NoneType attribute access",
+                        "high",
+                        "runtime",
+                        f"`{node.value.id}` may be None before accessing `.{node.attr}`.",
+                        node.lineno,
+                        node.col_offset + 1,
+                        section=f"line {node.lineno}",
+                        source="avatar-runtime",
+                        fix_hint=f"Validate `{node.value.id}` before attribute access or provide a safe default.",
+                    )
+                )
+
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            if not guarded_by_if(tree, node, node.value.id):
+                ctx.add(
+                    Diagnostic(
+                        "Unsafe indexing without validation",
+                        "medium",
+                        "runtime",
+                        f"`{node.value.id}[...]` can raise KeyError, IndexError, or TypeError.",
+                        node.lineno,
+                        node.col_offset + 1,
+                        section=f"line {node.lineno}",
+                        source="avatar-runtime",
+                        fix_hint="Check container existence and key/index availability before indexing.",
+                    )
+                )
+
+        if isinstance(node, ast.Await) and not inside_async_function(tree, node):
+            ctx.add(
+                Diagnostic(
+                    "await outside async function",
+                    "critical",
+                    "runtime",
+                    "await can only run inside an async function.",
+                    node.lineno,
+                    node.col_offset + 1,
+                    section=f"line {node.lineno}",
+                    source="avatar-runtime",
+                    fix_hint="Move the await into an async function or run it through an event loop.",
+                )
+            )
+
+    if re.search(r"except\s*:\s*(pass)?", ctx.code):
+        line, column = offset_to_line_column(ctx.code, re.search(r"except\s*:", ctx.code).start())
+        ctx.add(
+            Diagnostic(
+                "Bare exception handler",
+                "medium",
+                "runtime",
+                "Bare except blocks hide real runtime failures and make debugging harder.",
+                line,
+                column,
+                section=f"line {line}",
+                source="avatar-runtime",
+                fix_hint="Catch specific exception types and log or handle the error path.",
+            )
+        )
+
+
+def js_runtime_risks(ctx: AnalysisContext) -> None:
+    patterns = [
+        (r"\bfetch\s*\((?![^)]*signal)(?![^)]*timeout)", "Fetch without timeout or abort signal", "high", "runtime", "fetch can hang without AbortController-based cancellation.", "Use AbortController and handle non-2xx responses."),
+        (r"\.json\s*\(\s*\)(?!\s*\.catch)", "JSON parsing without catch", "medium", "runtime", "response.json() can reject on invalid JSON.", "Wrap await response.json() in try/catch and validate response.ok."),
+        (r"addEventListener\s*\([^)]*\)", "Event listener may need cleanup", "low", "runtime", "Long-lived listeners can leak memory in dynamic screens.", "Remove listeners during teardown when elements are replaced."),
+        (r"\bawait\b(?![\s\S]{0,120}catch)", "Await without nearby error handling", "medium", "runtime", "Rejected promises can crash the action path.", "Use try/catch around awaited IO or promise-heavy code."),
+    ]
+    add_regex_diagnostics(ctx, patterns, "avatar-runtime")
+
+
+def html_risks(ctx: AnalysisContext) -> None:
+    patterns = [
+        (r"<img\b(?![^>]*\balt=)", "Image missing alt text", "medium", "style", "Missing alt text hurts accessibility.", "Add meaningful alt text or alt=\"\" for decorative images."),
+        (r"<button\b(?![^>]*\b(type|aria-label)=)", "Button missing type or accessible label", "low", "style", "Buttons should define behavior and accessible purpose.", "Add type=\"button\" and clear visible text or aria-label."),
+    ]
+    add_regex_diagnostics(ctx, patterns, "avatar-html")
+
+
+def css_risks(ctx: AnalysisContext) -> None:
+    patterns = [
+        (r"100vw", "Potential horizontal overflow", "medium", "style", "100vw can include scrollbar width and create horizontal overflow.", "Prefer width: 100% for page-width elements."),
+        (r"position\s*:\s*fixed", "Fixed positioning responsiveness risk", "low", "style", "Fixed elements can overlap content on small screens.", "Verify mobile breakpoints and safe-area behavior."),
+    ]
+    add_regex_diagnostics(ctx, patterns, "avatar-css")
+
+
+def external_tool_analysis(ctx: AnalysisContext) -> None:
+    ctx.stage("[ok] Running professional tool adapters...")
+    if ctx.language == "python":
+        diagnostics, statuses = run_python_tools(ctx.code)
+    elif ctx.language in {"javascript", "typescript", "html", "css"}:
+        diagnostics, statuses = run_node_tools(ctx.code, ctx.language)
+    else:
+        diagnostics, statuses = [], []
+    ctx.diagnostics.extend(diagnostics)
+    ctx.tool_status.extend(statuses)
+
+
+def add_regex_diagnostics(ctx: AnalysisContext, patterns: list[tuple[str, str, str, str, str, str]], source: str) -> None:
+    for pattern, title, severity, category, detail, hint in patterns:
+        for match in re.finditer(pattern, ctx.code, flags=re.IGNORECASE | re.DOTALL):
+            line, column = offset_to_line_column(ctx.code, match.start())
+            ctx.add(Diagnostic(title, severity, category, detail, line, column, section=f"line {line}", source=source, fix_hint=hint))
+
+
+def dotted_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = dotted_name(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    return ""
+
+
+def inside_try(tree: ast.AST, target: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try):
+            for child in node.body:
+                if contains_node(child, target):
+                    return True
+    return False
+
+
+def inside_async_function(tree: ast.AST, target: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and contains_node(node, target):
+            return True
+    return False
+
+
+def guarded_by_if(tree: ast.AST, target: ast.AST, variable: str) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and contains_node(node, target):
+            test = ast.unparse(node.test) if hasattr(ast, "unparse") else ""
+            if variable in test:
+                return True
+    return False
+
+
+def contains_node(parent: ast.AST, target: ast.AST) -> bool:
+    return any(child is target for child in ast.walk(parent))
+
+
+def offset_to_line_column(code: str, offset: int) -> tuple[int, int]:
+    prefix = code[:offset]
+    line = prefix.count("\n") + 1
+    column = len(prefix.rsplit("\n", 1)[-1]) + 1
+    return line, column
+
+
+def confidence_score(ctx: AnalysisContext) -> int:
+    if not ctx.diagnostics:
+        return 88
+    tool_bonus = 4 if any(status.available for status in ctx.tool_status) else 0
+    runtime_bonus = 3 if any(item.category == "runtime" for item in ctx.diagnostics) else 0
+    return min(97, 86 + tool_bonus + runtime_bonus)
+
+
+def heuristic_review(code: str, language: str) -> dict:
+    return analyze_code(code, language)
+
+
+def heuristic_fix(code: str, language: str) -> str:
+    fixed = code.rstrip() + "\n"
+    if language == "python":
+        fixed = fixed.replace(" == None", " is None").replace(" != None", " is not None")
+        fixed = re.sub(r"print\s*\((['\"]debug:.*?['\"])\)\n?", "", fixed, flags=re.IGNORECASE)
+        fixed = re.sub(r"requests\.(get|post|put|delete)\(([^)\n]*?)\)", _add_timeout, fixed)
+    if language in {"javascript", "typescript", "html"}:
+        fixed = fixed.replace(".innerHTML =", ".textContent =")
+        fixed = fixed.replace("var ", "let ")
+    return fixed
+
+
+def _add_timeout(match: re.Match) -> str:
+    call = match.group(0)
+    if "timeout=" in call:
+        return call
+    if call.endswith(")"):
+        if call[-2] == "(":
+            return call[:-1] + "timeout=10)"
+        return call[:-1] + ", timeout=10)"
+    return call

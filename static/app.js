@@ -1,0 +1,2905 @@
+/* global prompt, alert, console, requestAnimationFrame, setInterval, cancelAnimationFrame */
+/* eslint-disable no-unused-vars */
+let editor;
+let fixStartedAt = 0;
+let tokenEstimate = 0;
+
+
+let audioCtx = null;
+let micStream = null;
+let scriptNode = null;
+let pcmSamples = [];
+
+const CODE_REQUEST_PATTERN =
+  /\b(write|create|implement|generate|build|make|draft|develop|scaffold|add|show me|give me|code|script|function|class|program|component|api)\b/i;
+
+const SAVE_REQUEST_PATTERN = /\b(save|save file|deploy|save it|write to file|save to file)\b/i;
+
+const ERROR_PATTERNS = [
+  "error", "exception", "traceback", "crash", "failed", "bug", "issue", "invalid", "fail", "broken",
+  "does not work", "wrong", "syntaxerror", "typeerror", "referenceerror", "nullpointer"
+];
+
+function isErrorReport(message) {
+  const lower = message.toLowerCase();
+  const hasKeyword = ERROR_PATTERNS.some(keyword => lower.includes(keyword));
+  const hasTraceback = /traceback|at \w+\.js|\bat \b|line \d+/i.test(message);
+  return hasKeyword || hasTraceback;
+}
+
+const SUPPORTED_LANGUAGES = new Set([
+  "auto",
+  "python",
+  "javascript",
+  "typescript",
+  "html",
+  "css",
+  "sql",
+  "json",
+  "yaml",
+  "bash",
+  "cpp",
+  "rust",
+]);
+
+const MONACO_LANGUAGE_MAP = {
+  python: "python",
+  javascript: "javascript",
+  typescript: "typescript",
+  html: "html",
+  css: "css",
+  sql: "sql",
+  json: "json",
+  yaml: "yaml",
+  bash: "shell",
+  cpp: "cpp",
+  rust: "rust",
+};
+
+const state = {
+  model: "qwen2.5-coder",
+  language: "python",
+  lastChatRequest: "",
+  currentIssues: [],
+  originalCodeBeforeFix: "",
+  chatHistory: [],
+  chatStreaming: false,
+  lastWorkspaceSync: "",
+  currentFile: null,
+  openFiles: [],
+  workspaceFiles: [],
+  project: "",
+};
+
+const $ = (id) => document.getElementById(id);
+
+function setStatus(text, active = false) {
+  const status = $("aiStatus");
+  status.replaceChildren(document.createElement("span"), document.createTextNode(` ${text}`));
+  $("processingState").textContent = `Processing: ${active ? "active" : "idle"}`;
+}
+
+function logProgress(message) {
+  const container = document.getElementById("progressContent");
+  if (container) {
+    const line = document.createElement("div");
+    line.className = "log-line";
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+    container.prepend(line);
+  }
+  log(message);
+}
+
+async function loadProjectRequirements() {
+  const reqsContent = document.getElementById("requirementsContent");
+  if (!reqsContent) return;
+  try {
+    const response = await fetch(`/api/project/requirements?project_id=${encodeURIComponent(state.project || "default")}`);
+    if (response.ok) {
+      const data = await response.json();
+      const reqs = data.requirements;
+      if (reqs && reqs.requirements && reqs.requirements.length > 0) {
+        reqsContent.innerHTML = "<h3>Project Requirements</h3>";
+        reqs.requirements.forEach((req, idx) => {
+          const div = document.createElement("div");
+          div.className = "requirement-item";
+          div.textContent = `${idx + 1}. ${req}`;
+          reqsContent.appendChild(div);
+        });
+        return;
+      }
+    }
+  } catch (err) {
+    console.error("Failed to load project requirements:", err);
+  }
+  // Default fallback requirements
+  reqsContent.innerHTML = `
+    <h3>Project Requirements</h3>
+    <div class="requirement-item">1. Streamline the workspace companion to act as the primary interface.</div>
+    <div class="requirement-item">2. Let the AI bot write and refactor code inside Monaco automatically.</div>
+    <div class="requirement-item">3. Monitor progress of current request in the Progress tab.</div>
+  `;
+}
+
+function log(message) {
+  const line = document.createElement("div");
+  line.className = "log-line";
+  line.textContent = message;
+  $("logs").prepend(line);
+}
+
+function setProgress(value) {
+  $("progressBar").style.width = `${Math.max(0, Math.min(100, value))}%`;
+}
+
+function getCode() {
+  return editor ? editor.getValue() : "";
+}
+
+function setCode(code) {
+  if (editor) editor.setValue(code);
+}
+
+function updateEditorLanguage(language) {
+  if (!editor || !window.monaco) return;
+  const monacoLanguage = language === "auto" ? "python" : MONACO_LANGUAGE_MAP[language] || "python";
+  monaco.editor.setModelLanguage(editor.getModel(), monacoLanguage);
+  $("editorMeta").textContent = `${language} / workspace buffer`;
+}
+
+function isCodeGenerationRequest(message) {
+  return CODE_REQUEST_PATTERN.test(message);
+}
+
+function isSaveRequest(message) {
+  return SAVE_REQUEST_PATTERN.test(message);
+}
+
+function isSaveOnlyRequest(message) {
+  return isSaveRequest(message) && !isCodeGenerationRequest(message);
+}
+
+function isWriteAndSaveRequest(message) {
+  return isCodeGenerationRequest(message) && isSaveRequest(message);
+}
+
+function extractCodeBlocks(text) {
+  const blocks = [];
+  const regex = /```([^\n`]*)\n?([\s\S]*?)```/g;
+  let match = regex.exec(text);
+  while (match) {
+    const language = (match[1] || "").trim().toLowerCase();
+    const code = (match[2] || "").trim();
+    if (code) blocks.push({ language, code });
+    match = regex.exec(text);
+  }
+  return blocks;
+}
+
+function isPlaceholderWorkspace(code) {
+  const trimmed = code.trim();
+  if (!trimmed) return true;
+  const executableLines = trimmed
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("//") && !line.startsWith("#"));
+  return executableLines.length === 0;
+}
+
+function normalizeWorkspaceLanguage(language) {
+  const value = (language || "auto").toLowerCase();
+  return SUPPORTED_LANGUAGES.has(value) ? value : "auto";
+}
+
+function applyCodeToWorkspace(code, languageHint = "auto", source = "chat") {
+  const cleaned = code.trim();
+  if (!cleaned || cleaned === state.lastWorkspaceSync) return false;
+
+  const zone = document.querySelector(".editor-zone");
+  if (isPlaceholderWorkspace(getCode())) {
+    setCode(`${cleaned}\n`);
+  } else if (isCodeGenerationRequest(source === "chat" ? state.lastChatRequest || "" : source)) {
+    setCode(`${cleaned}\n`);
+  } else {
+    const selection = editor.getSelection();
+    const selected = editor.getModel().getValueInRange(selection).trim();
+    if (!selected) {
+      editor.executeEdits("avatar", [{ range: selection, text: cleaned, forceMoveMarkers: true }]);
+    } else {
+      setCode(`${cleaned}\n`);
+    }
+  }
+
+  const language = normalizeWorkspaceLanguage(languageHint);
+  if (language !== "auto") {
+    state.language = language;
+    $("languageSelect").value = language;
+    updateEditorLanguage(language);
+    updateFilenameExtension(language);
+  }
+
+  state.lastWorkspaceSync = cleaned;
+  $("workspaceLink").classList.add("active");
+  $("editorMeta").textContent = `Synced from AI ${source}`;
+  log(`[ok] Code synced to workspace from ${source}.`);
+  zone?.classList.add("workspace-sync");
+  window.setTimeout(() => zone?.classList.remove("workspace-sync"), 1400);
+  editor?.focus();
+  return true;
+}
+
+async function loadModels() {
+  try {
+    const response = await fetch("/api/models");
+    const data = await response.json();
+    if (data && data.models && data.models.length > 0) {
+      // Prioritize qwen2.5-coder:14b or other coder tags, else pick the first returned model
+      const coderModel = data.models.find(m => m.toLowerCase().includes("coder")) || data.models[0];
+      state.model = coderModel;
+    }
+    const select = $("modelSelect");
+    if (select) {
+      select.replaceChildren();
+      data.models.forEach((model) => {
+        const option = document.createElement("option");
+        option.textContent = model;
+        option.value = model;
+        select.appendChild(option);
+      });
+      state.model = select.value;
+    }
+  } catch (err) {
+    console.error("Failed to load models:", err);
+    log("[!] Could not load Ollama models; using defaults.");
+  }
+}
+
+function renderReview(data) {
+  state.currentIssues = data.issues || [];
+  $("issueCount").textContent = data.issue_count;
+  $("confidence").textContent = `${data.confidence}%`;
+  $("fixTime").textContent = data.estimated_fix_time;
+  $("severity").textContent = `Severity: ${data.severity} / Language: ${data.language || state.language}`;
+  renderPipeline(data.pipeline || []);
+  renderIssues(state.currentIssues);
+  applyEditorDiagnostics(state.currentIssues);
+}
+
+function renderPipeline(pipeline) {
+  const target = $("pipeline");
+  target.replaceChildren();
+  pipeline.slice(-6).forEach((step) => {
+    const pill = document.createElement("span");
+    pill.textContent = step;
+    target.appendChild(pill);
+  });
+}
+
+function renderIssues(issues) {
+  const target = $("issues");
+  if (target) {
+    target.replaceChildren();
+
+    if (!issues.length) {
+      target.className = "issues empty";
+      target.textContent = "No obvious issues found.";
+    } else {
+      target.className = "issues";
+      issues.forEach((issue) => {
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = `issue ${issue.severity}`;
+        item.addEventListener("click", () => revealIssue(issue));
+
+        const title = document.createElement("strong");
+        title.textContent = `${issue.severity.toUpperCase()} / ${issue.title}`;
+
+        const detail = document.createElement("p");
+        detail.textContent = `${issue.category} / line ${issue.line}:${issue.column} / ${issue.source} - ${issue.detail}`;
+
+        const hint = document.createElement("small");
+        hint.textContent = issue.fix_hint || "Click to jump to this diagnostic.";
+
+        item.append(title, detail, hint);
+        target.appendChild(item);
+      });
+    }
+  }
+
+  // Update problems list in bottom panel
+  const probList = $("problemsList");
+  const bottomCount = $("bottomProblemCount");
+  if (bottomCount) {
+    bottomCount.textContent = issues.length;
+  }
+  if (probList) {
+    probList.replaceChildren();
+    if (!issues.length) {
+      const emptyMsg = document.createElement("div");
+      emptyMsg.className = "problem-item low";
+      emptyMsg.innerHTML = `<span class="prob-severity">INFO</span><span class="prob-desc">No diagnostics or errors detected in current session.</span>`;
+      probList.appendChild(emptyMsg);
+    } else {
+      issues.forEach((issue) => {
+        const item = document.createElement("div");
+        item.className = `problem-item ${issue.severity}`;
+        item.style.cursor = "pointer";
+        item.innerHTML = `
+          <span class="prob-severity">${issue.severity.toUpperCase()}</span>
+          <span class="prob-desc">Line ${issue.line}: ${issue.title} - ${issue.detail}</span>
+        `;
+        item.addEventListener("click", () => revealIssue(issue));
+        probList.appendChild(item);
+      });
+    }
+  }
+}
+
+function revealIssue(issue) {
+  if (!editor) return;
+  setActiveTab("diagnostics");
+  editor.revealPositionInCenter({ lineNumber: issue.line || 1, column: issue.column || 1 });
+  editor.setPosition({ lineNumber: issue.line || 1, column: issue.column || 1 });
+  editor.focus();
+}
+
+function applyEditorDiagnostics(issues) {
+  if (!editor || !window.monaco) return;
+  const model = editor.getModel();
+  const markers = issues.map((issue) => ({
+    severity: markerSeverity(issue.severity),
+    message: `${issue.title}\n${issue.detail}${issue.fix_hint ? `\nFix: ${issue.fix_hint}` : ""}`,
+    source: issue.source || "avatar",
+    startLineNumber: issue.line || 1,
+    startColumn: issue.column || 1,
+    endLineNumber: issue.end_line || issue.line || 1,
+    endColumn: issue.end_column || Math.max(2, (issue.column || 1) + 1),
+  }));
+  monaco.editor.setModelMarkers(model, "avatar", markers);
+
+  const decorations = issues.map((issue) => ({
+    range: new monaco.Range(issue.line || 1, issue.column || 1, issue.end_line || issue.line || 1, issue.end_column || Math.max(2, (issue.column || 1) + 1)),
+    options: {
+      className: `avatar-inline-${issue.severity}`,
+      glyphMarginClassName: `avatar-glyph avatar-glyph-${issue.severity}`,
+      hoverMessage: { value: `**${issue.title}**\n\n${issue.detail}\n\n${issue.fix_hint || ""}` },
+      minimap: { color: severityColor(issue.severity), position: monaco.editor.MinimapPosition.Inline },
+      overviewRuler: { color: severityColor(issue.severity), position: monaco.editor.OverviewRulerLane.Right },
+    },
+  }));
+  state.decorations = editor.deltaDecorations(state.decorations, decorations);
+}
+
+function markerSeverity(severity) {
+  const map = {
+    critical: monaco.MarkerSeverity.Error,
+    high: monaco.MarkerSeverity.Error,
+    medium: monaco.MarkerSeverity.Warning,
+    low: monaco.MarkerSeverity.Info,
+  };
+  return map[severity] || monaco.MarkerSeverity.Warning;
+}
+
+function severityColor(severity) {
+  return {
+    critical: "#ff4f6d",
+    high: "#ff4f6d",
+    medium: "#f6c45f",
+    low: "#00e5ff",
+  }[severity] || "#00e5ff";
+}
+
+async function reviewCode() {
+  const code = getCode().trim();
+  if (!code) {
+    log("[!] Paste code before requesting analysis.");
+    return;
+  }
+  setActiveTab("diagnostics");
+  setStatus("Reviewing", true);
+  setProgress(18);
+  log("[ok] Running static analysis...");
+  if (window.avatarSpeak) window.avatarSpeak("Reviewing workspace code buffer. Searching for diagnostics...", "thinking");
+  try {
+    const response = await fetch("/api/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, language: state.language, model: state.model }),
+    });
+    const data = await response.json();
+    renderReview(data);
+    setProgress(100);
+    setStatus(data.ollama_available ? "Analysis complete" : "Local analysis complete");
+    log(data.ollama_available ? "[ok] LLM review merged." : "[ok] Local layered analysis complete.");
+    updateMetricsAndDial('review');
+    if (window.avatarSpeak) {
+      if (data.issue_count > 0) {
+        window.avatarSpeak(`Analysis complete. Found ${data.issue_count} warning${data.issue_count === 1 ? '' : 's'} in current file.`, "info");
+      } else {
+        window.avatarSpeak("Review complete! No issues detected in this file.", "success");
+      }
+    }
+  } catch {
+    setStatus("Review failed");
+    log("[!] Review request failed. Check that the FastAPI server is running.");
+    if (window.avatarSpeak) window.avatarSpeak("Diagnostics failed. Check if FastAPI server is active.", "error");
+  }
+}
+
+async function fixCode() {
+  const code = getCode();
+  if (!code.trim()) {
+    log("[!] Paste code before requesting repair.");
+    return;
+  }
+  state.originalCodeBeforeFix = code;
+  setActiveTab("logs");
+  setStatus("Repairing", true);
+  setProgress(4);
+  $("streamStatus").textContent = "Streaming: active";
+  fixStartedAt = performance.now();
+  tokenEstimate = 0;
+
+  try {
+    const response = await fetch("/api/fix/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, language: state.language, model: state.model }),
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const payload = JSON.parse(line);
+        if (payload.type === "analysis") renderReview(payload.analysis);
+        if (payload.type === "log") log(payload.message);
+        if (payload.type === "progress") setProgress(payload.value);
+        if (payload.type === "code") updateStreamingCode(payload.code);
+        if (payload.type === "done") finishRepair(payload.code);
+      }
+    }
+  } catch {
+    setStatus("Repair failed");
+    log("[!] Repair request failed. Check that the FastAPI server is running.");
+  }
+}
+
+function updateStreamingCode(code) {
+  setCode(code);
+  tokenEstimate += Math.max(1, code.length / 4);
+  const elapsed = Math.max(1, (performance.now() - fixStartedAt) / 1000);
+  $("tokenSpeed").textContent = `Tokens/s: ${Math.round(tokenEstimate / elapsed)}`;
+}
+
+function finishRepair(code) {
+  setCode(code);
+  renderDiff(state.originalCodeBeforeFix, code);
+  setProgress(100);
+  $("streamStatus").textContent = "Streaming: complete";
+  setStatus("Repair complete");
+  setActiveTab("logs");
+  updateMetricsAndDial('fix');
+  if (window.avatarSpeak) window.avatarSpeak("Repair successfully applied! The code has been refactored.", "success");
+}
+
+function renderDiff(original, repaired) {
+  const target = $("diffView");
+  if (!target) return;
+  target.replaceChildren();
+  const changes = buildLineDiff(original, repaired);
+  const changedCount = changes.filter((item) => item.type !== "same").length;
+  $("diffSummary").textContent = `${changedCount} changed line${changedCount === 1 ? "" : "s"} detected.`;
+
+  changes.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = `diff-line ${item.type}`;
+    const marker = document.createElement("span");
+    marker.className = "diff-marker";
+    marker.textContent = item.type === "add" ? "+" : item.type === "delete" ? "-" : " ";
+    const text = document.createElement("code");
+    text.textContent = item.text || " ";
+    row.append(marker, text);
+    target.appendChild(row);
+  });
+}
+
+function buildLineDiff(original, repaired) {
+  const a = original.split("\n");
+  const b = repaired.split("\n");
+  if (a.length * b.length > 90000) return simpleLineDiff(a, b);
+
+  const dp = Array.from({ length: a.length + 1 }, () => Array(b.length + 1).fill(0));
+  for (let i = a.length - 1; i >= 0; i -= 1) {
+    for (let j = b.length - 1; j >= 0; j -= 1) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+
+  const result = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      result.push({ type: "same", text: a[i] });
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      result.push({ type: "delete", text: a[i] });
+      i += 1;
+    } else {
+      result.push({ type: "add", text: b[j] });
+      j += 1;
+    }
+  }
+  while (i < a.length) result.push({ type: "delete", text: a[i++] });
+  while (j < b.length) result.push({ type: "add", text: b[j++] });
+  return result;
+}
+
+function simpleLineDiff(a, b) {
+  const max = Math.max(a.length, b.length);
+  const result = [];
+  for (let index = 0; index < max; index += 1) {
+    if (a[index] === b[index]) result.push({ type: "same", text: a[index] || "" });
+    else {
+      if (a[index] !== undefined) result.push({ type: "delete", text: a[index] });
+      if (b[index] !== undefined) result.push({ type: "add", text: b[index] });
+    }
+  }
+  return result;
+}
+
+function copyOutput() {
+  navigator.clipboard.writeText(getCode());
+  log("[ok] Current editor output copied.");
+}
+
+async function saveWorkspaceCode(source = "button") {
+  const code = getCode();
+  let filename = $("saveFilenameInput").value.trim();
+  
+  if (!filename || filename === "untitled.py") {
+    const firstLines = code.split("\n").slice(0, 15).join("\n");
+    let suggestedName = "";
+    if (firstLines.includes("class ") || firstLines.includes("def ")) {
+      const match = firstLines.match(/(?:class|def)\s+(\w+)/);
+      if (match) {
+        suggestedName = match[1].replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase() + ".py";
+      }
+    }
+    if (!suggestedName && (code.includes("import express") || code.includes("require("))) {
+      suggestedName = "server.js";
+    }
+    if (!suggestedName && code.includes("<!DOCTYPE html>")) {
+      suggestedName = "index.html";
+    }
+    if (!suggestedName && code.includes("import sqlite3")) {
+      suggestedName = "database.py";
+    }
+    if (!suggestedName && (code.includes("SELECT ") || code.includes("CREATE TABLE"))) {
+      suggestedName = "schema.sql";
+    }
+    
+    if (suggestedName) {
+      filename = suggestedName;
+    } else {
+      const lang = state.language === "auto" ? "python" : state.language;
+      const extMap = {
+        python: "app.py",
+        javascript: "index.js",
+        typescript: "index.ts",
+        html: "index.html",
+        css: "styles.css",
+        json: "config.json",
+        sql: "query.sql"
+      };
+      filename = extMap[lang] || "app.py";
+    }
+    $("saveFilenameInput").value = filename;
+  }
+
+  setActiveTab("output");
+  setStatus("Saving file", true);
+  log(`[save] Saving workspace code as "${filename}"...`);
+
+  try {
+    const response = await fetch(`/api/save?project_id=${encodeURIComponent(state.project || "")}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename, code })
+    });
+    
+    if (!response.ok) {
+      const err = await response.json();
+      throw new Error(err.detail || `Server returned ${response.status}`);
+    }
+    
+    const data = await response.json();
+    if (!data.success) {
+      throw new Error(data.message || "Failed to save file.");
+    }
+
+    setStatus("Save complete", false);
+    log(`[ok] Successfully saved to ${filename}.`);
+    updateMetricsAndDial('save');
+    if (window.avatarSpeak) window.avatarSpeak(`Saved workspace buffer to ${filename}.`, "success");
+  } catch (error) {
+    setStatus("Save failed", false);
+    log(`[!] Save failed: ${error.message || error}`);
+    if (window.avatarSpeak) window.avatarSpeak("Failed to save workspace file.", "error");
+  }
+}
+
+
+function setActiveTab(name) {
+  document.querySelectorAll(".tab").forEach((button) => {
+    button.classList.toggle("active", button.dataset.tab === name);
+  });
+  document.querySelectorAll(".tab-panel").forEach((panel) => {
+    panel.classList.toggle("active", panel.id === `${name}Panel`);
+  });
+}
+
+async function sendChat(message) {
+  const trimmed = message.trim();
+  if (!trimmed || state.chatStreaming) return;
+
+  const progressContent = document.getElementById("progressContent");
+  if (progressContent) progressContent.innerHTML = "";
+  logProgress(`Command received: "${trimmed}"`);
+
+  const progressTab = document.querySelector('.bottom-tab[data-panel="progress"]');
+  if (progressTab) {
+    progressTab.click();
+  }
+
+  state.chatStreaming = true;
+  state.lastChatRequest = trimmed;
+  setStatus("Chat thinking", true);
+  $("voiceWaveform")?.classList.add("active");
+  if (window.avatarSpeak) window.avatarSpeak("Processing your request...", "thinking");
+  const assistant = addChatMessage("assistant", "");
+  let full = "";
+  let workspaceApplied = false;
+
+  let projectContext = "";
+  if (state.workspaceFiles && state.workspaceFiles.length > 0) {
+    projectContext = "Project structure:\n";
+    const flattenTree = (nodes, prefix = "") => {
+      nodes.forEach(n => {
+        projectContext += `${prefix}- ${n.name}${n.is_dir ? '/' : ''}\n`;
+        if (n.children) flattenTree(n.children, prefix + "  ");
+      });
+    };
+    flattenTree(state.workspaceFiles);
+    projectContext += `\nCurrently editing file: ${state.currentFile || 'None'}\n`;
+  }
+
+  try {
+    const response = await fetch("/api/chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: trimmed,
+        code: getSelectedOrFullCode(),
+        language: state.language,
+        model: state.model,
+        history: state.chatHistory.slice(-8),
+        project_context: projectContext,
+        project_id: state.project || "",
+      }),
+    });
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const payload = JSON.parse(line);
+        if (payload.type === "chunk") {
+          full += payload.text;
+          renderMarkdown(assistant, full, { allowApply: true });
+          scrollChatToBottom();
+          if (!workspaceApplied && (isCodeGenerationRequest(trimmed) || isErrorReport(trimmed))) {
+            const blocks = extractCodeBlocks(full);
+            const complete = blocks.find((block) => block.code.split("\n").length > 2 || block.code.length > 80);
+            if (complete) {
+              logProgress("Extracting code from AI response...");
+              workspaceApplied = applyCodeToWorkspace(complete.code, complete.language || state.language, "chat");
+              if (workspaceApplied) {
+                logProgress("Code changes loaded into active workspace buffer.");
+              }
+            }
+          }
+        }
+        if (payload.type === "workspace" && payload.code) {
+          logProgress("Syncing code to active file editor...");
+          workspaceApplied = applyCodeToWorkspace(
+            payload.code,
+            payload.language || state.language,
+            "chat",
+          ) || workspaceApplied;
+          if (workspaceApplied) {
+            logProgress("Active editor updated successfully.");
+          }
+        }
+        if (payload.type === "task" && payload.task_id) {
+          logProgress(`Task ${payload.task_id} auto-scheduled in background.`);
+          if (payload.project_id) {
+            state.project = payload.project_id;
+            await fetchProjects();
+            const sel = $("projectSelect");
+            if (sel) {
+              sel.value = payload.project_id;
+            }
+            await fetchWorkspaceFiles();
+          }
+          startDashboardPolling(payload.task_id);
+          startWorkspaceSync(payload.project_id || state.project);
+        }
+        if (payload.type === "stats") {
+          logProgress(`Stats: Efficiency ${payload.ai_efficiency || "90%"}, Suggestions ${payload.suggestions || 0}, Issues Fixed ${payload.issues_fixed || 0}`);
+          updateEfficiencyDial(parseInt(payload.ai_efficiency) || 90);
+        }
+        if (payload.type === "done") {
+          logProgress("Command completed successfully.");
+        }
+      }
+    }
+
+    if (!workspaceApplied && (isCodeGenerationRequest(trimmed) || isErrorReport(trimmed))) {
+      const blocks = extractCodeBlocks(full);
+      if (blocks.length) {
+        const largest = blocks.reduce((best, block) => (block.code.length > best.code.length ? block : best));
+        workspaceApplied = applyCodeToWorkspace(largest.code, largest.language || state.language, "chat");
+      }
+    }
+
+    const shouldAutoSave = workspaceApplied && (isSaveRequest(trimmed) || isErrorReport(trimmed));
+    if (shouldAutoSave) {
+      await saveWorkspaceCode("chat");
+    }
+
+    state.chatHistory.push({ role: "user", content: trimmed }, { role: "assistant", content: full });
+    renderMarkdown(assistant, full, { allowApply: true });
+    setStatus(
+      shouldAutoSave ? "Code synced and saved" : workspaceApplied ? "Code synced to workspace" : "Chat complete",
+    );
+    updateMetricsAndDial('chat');
+    if (window.avatarSpeak) window.avatarSpeak("Response generated successfully.", "success");
+  } catch {
+    renderMarkdown(assistant, "Chat request failed. Check that the FastAPI server is running.");
+    setStatus("Chat failed");
+    if (window.avatarSpeak) window.avatarSpeak("Request failed. Server is offline.", "error");
+  } finally {
+    state.chatStreaming = false;
+    $("voiceWaveform")?.classList.remove("active");
+  }
+}
+
+function getSelectedOrFullCode() {
+  if (!editor) return "";
+  const selection = editor.getSelection();
+  const selected = editor.getModel().getValueInRange(selection).trim();
+  return selected || editor.getValue();
+}
+
+function addChatMessage(role, text) {
+  // Update the pet bubble text (limit to simple text or fallback)
+  const petBubble = document.getElementById("petBubble");
+  if (petBubble) {
+    petBubble.classList.remove("hidden");
+    petBubble.style.opacity = "1";
+    petBubble.style.pointerEvents = "auto";
+    if (window._avatarBubbleTimer) clearTimeout(window._avatarBubbleTimer);
+
+    const bubbleText = petBubble.querySelector(".bubble-text");
+    if (bubbleText) {
+      // Strip markdown code blocks to keep bubble text clean and readable
+      const cleanText = text.replace(/```[\s\S]*?```/g, "[Code Generated]").trim();
+      bubbleText.innerHTML = cleanText || "Processing...";
+    }
+  }
+
+  // Also append/stream to the bottom progress panel so the user can see it cleanly!
+  const progressContent = document.getElementById("progressContent");
+  if (progressContent) {
+    let msgEl = progressContent.querySelector(`.chat-message-stream.${role}`);
+    if (!msgEl) {
+      msgEl = document.createElement("div");
+      msgEl.className = `chat-message-stream ${role}`;
+      msgEl.style.marginTop = "12px";
+      msgEl.style.padding = "12px";
+      msgEl.style.background = "rgba(255, 255, 255, 0.03)";
+      msgEl.style.border = "1px solid rgba(255, 255, 255, 0.08)";
+      msgEl.style.borderRadius = "6px";
+      msgEl.style.borderLeft = role === "user" ? "3px solid #00f0ff" : "3px solid #ff007f";
+      msgEl.style.fontFamily = "'JetBrains Mono', monospace";
+      msgEl.style.fontSize = "0.75rem";
+      msgEl.style.color = "#ffffff";
+      progressContent.appendChild(msgEl);
+    }
+    renderMarkdown(msgEl, text, { allowApply: true });
+    
+    // Auto-scroll progress pane to the bottom so user sees updates
+    const progressPane = document.getElementById("panelProgress");
+    if (progressPane) {
+      progressPane.scrollTop = progressPane.scrollHeight;
+    }
+    
+    return msgEl;
+  }
+
+  const message = document.createElement("div");
+  message.className = `chat-message ${role}`;
+  renderMarkdown(message, text);
+  return message;
+}
+
+function renderMarkdown(target, text, options = {}) {
+  target.replaceChildren();
+  const parts = text.split(/```([^\n`]*)\n?([\s\S]*?)```/g);
+  parts.forEach((part, index) => {
+    if (index % 3 === 1) {
+      const language = (part || "").trim().toLowerCase();
+      const codeBody = parts[index + 1] || "";
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      code.textContent = codeBody.trim();
+      pre.appendChild(code);
+      if (options.allowApply && codeBody.trim()) {
+        const toolbar = document.createElement("div");
+        toolbar.className = "code-block-toolbar";
+        const label = document.createElement("span");
+        label.textContent = language || "code";
+        const apply = document.createElement("button");
+        apply.type = "button";
+        apply.textContent = "Apply to Workspace";
+        apply.addEventListener("click", () => {
+          applyCodeToWorkspace(codeBody, language || state.language, "chat");
+        });
+        toolbar.append(label, apply);
+        const wrap = document.createElement("div");
+        wrap.className = "code-block-wrap";
+        wrap.append(toolbar, pre);
+        target.appendChild(wrap);
+      } else {
+        target.appendChild(pre);
+      }
+      return;
+    }
+    if (index % 3 === 2) return;
+    part.split("\n").forEach((line) => {
+      if (!line.trim()) {
+        target.appendChild(document.createElement("br"));
+        return;
+      }
+      const p = document.createElement("p");
+      p.textContent = line.replace(/^[-*]\s+/, "- ");
+      target.appendChild(p);
+    });
+  });
+}
+
+function scrollChatToBottom() {
+  const box = $("chatMessages");
+  if (box) box.scrollTop = box.scrollHeight;
+}
+
+function updateEfficiencyDial(percentage) {
+  const fill = $("radialEfficiencyFill");
+  const val = $("overviewDialVal");
+  if (fill && val) {
+    fill.setAttribute("stroke-dasharray", `${percentage}, 100`);
+    val.textContent = `${percentage}%`;
+  }
+}
+
+function updateMetricsAndDial(actionType) {
+  const eff = Math.floor(Math.random() * 11) + 88;
+  updateEfficiencyDial(eff);
+  
+  if (actionType === 'fix') {
+    const fixedEl = $("statIssuesFixed");
+    if (fixedEl) {
+      const cur = parseInt(fixedEl.textContent, 10) || 23;
+      fixedEl.textContent = cur + 1;
+    }
+  }
+  
+  const tokensEl = $("statTokens");
+  if (tokensEl) {
+    let curVal = parseFloat(tokensEl.textContent) || 24.8;
+    curVal += (Math.random() * 1.5 + 0.5);
+    tokensEl.textContent = curVal.toFixed(1) + "K";
+  }
+  
+  const sugEl = $("statSuggestions");
+  if (sugEl) {
+    const cur = parseInt(sugEl.textContent, 10) || 142;
+    sugEl.textContent = cur + Math.floor(Math.random() * 3 + 1);
+  }
+}
+
+function bindUi() {
+  $("saveButton")?.addEventListener("click", () => saveWorkspaceCode("button"));
+  $("saveToolbarButton")?.addEventListener("click", () => saveWorkspaceCode("toolbar"));
+  $("reviewButton")?.addEventListener("click", reviewCode);
+  $("fixButton")?.addEventListener("click", fixCode);
+  $("copyButton")?.addEventListener("click", copyOutput);
+
+  $("clearChatButton")?.addEventListener("click", () => {
+    state.chatHistory = [];
+    $("chatMessages").replaceChildren();
+    addChatMessage(
+      "assistant",
+      "Chat cleared. Ask AVATAR to write code, review diagnostics, explain errors, or optimize selected code. You can save your work directly to your computer.",
+    );
+  });
+  $("chatForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const input = $("chatInput");
+    sendChat(input.value);
+    input.value = "";
+  });
+  $("modelSelect")?.addEventListener("change", (event) => {
+    state.model = event.target.value;
+  });
+  $("languageSelect")?.addEventListener("change", (event) => {
+    state.language = event.target.value;
+    updateEditorLanguage(state.language);
+    updateFilenameExtension(state.language);
+  });
+  document.querySelectorAll(".tab").forEach((button) => {
+    button.addEventListener("click", () => setActiveTab(button.dataset.tab));
+  });
+
+  // Bottom tabs switching
+  document.querySelectorAll(".bottom-tab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".bottom-tab").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      const panelId = btn.dataset.panel;
+      document.querySelectorAll(".panel-view-content").forEach(panel => {
+        panel.classList.remove("active");
+      });
+      const panelMap = {
+        terminal: "panelTerminal",
+        problems: "panelProblems",
+        output: "panelOutput",
+        debug: "panelDebug",
+        requirements: "panelRequirements",
+        progress: "panelProgress"
+      };
+      const targetId = panelMap[panelId];
+      if (targetId && $(targetId)) {
+        $(targetId).classList.add("active");
+      }
+    });
+  });
+
+  // Left Ribbon Switching
+  document.querySelectorAll(".ribbon-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".ribbon-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      
+      const title = btn.getAttribute("title");
+      if (title === "Chat Room") {
+        setActiveTab("chat");
+      } else if (title === "AI Diagnostics & Performance") {
+        setActiveTab("diagnostics");
+      } else if (title === "Explorer") {
+        $("projectExplorerPanel")?.classList.remove("hidden");
+        $("quickActionsPanel")?.classList.remove("hidden");
+        $("agentDashboardPanel")?.classList.add("hidden");
+        $("fileTree")?.focus();
+      } else if (title === "Agent Dashboard") {
+        $("projectExplorerPanel")?.classList.add("hidden");
+        $("quickActionsPanel")?.classList.add("hidden");
+        $("agentDashboardPanel")?.classList.remove("hidden");
+        loadGitCheckpoints();
+      } else if (title === "Task Planner") {
+        window.location.href = "/static/study_planner.html";
+      } else if (title === "Search Files") {
+        $("globalSearchInput")?.focus();
+      }
+    });
+  });
+
+  // AI Tools selection and activation
+  const toolMap = {
+    toolCodeReview: () => { setActiveTab("diagnostics"); reviewCode(); },
+    toolErrorFixer: () => { setActiveTab("logs"); fixCode(); },
+    toolGenerator: () => {
+      setActiveTab("chat");
+      const input = $("chatInput");
+      if (input) {
+        input.placeholder = "Describe the code to generate — AVATAR will write it to the workspace...";
+        input.focus();
+      }
+    },
+    toolChat: () => {
+      setActiveTab("chat");
+      $("chatInput")?.focus();
+    },
+    toolDebugger: () => {
+      const debugTab = document.querySelector('.bottom-tab[data-panel="debug"]');
+      if (debugTab) debugTab.click();
+    },
+    toolTests: () => {
+      setActiveTab("chat");
+      const input = $("chatInput");
+      if (input) {
+        input.value = "Generate unit tests for the current code.";
+        input.focus();
+      }
+    }
+  };
+  
+  Object.keys(toolMap).forEach(id => {
+    const btn = $(id);
+    if (btn) {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tool-item").forEach(item => item.classList.remove("active"));
+        btn.classList.add("active");
+        toolMap[id]();
+      });
+    }
+  });
+
+  // Quick actions
+  $("actionNewFile")?.addEventListener("click", createNewWorkspaceFile);
+  $("actionFind")?.addEventListener("click", () => $("globalSearchInput")?.focus());
+  $("actionGoTo")?.addEventListener("click", () => {
+    if (!editor) return;
+    const line = prompt("Enter line number:");
+    if (line) {
+      const lineNum = parseInt(line, 10);
+      if (!isNaN(lineNum)) {
+        editor.revealPositionInCenter({ lineNumber: lineNum, column: 1 });
+        editor.setPosition({ lineNumber: lineNum, column: 1 });
+        editor.focus();
+      }
+    }
+  });
+
+  // Suggest chips
+  document.querySelectorAll(".prompt-chips .chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      const input = $("chatInput");
+      if (input) {
+        input.value = chip.textContent;
+        input.focus();
+      }
+    });
+  });
+
+  // Redirect search bar focus to AVATAR bot input overlay
+  $("globalSearchInput")?.addEventListener("focus", (e) => {
+    e.preventDefault();
+    e.target.blur();
+    if (typeof window.showInputOverlay === "function") {
+      window.showInputOverlay();
+    }
+  });
+
+  // Clear terminal action
+  $("clearTerminalBtn")?.addEventListener("click", () => {
+    const output = $("terminalOutput");
+    if (output) {
+      output.innerHTML = `<span class="term-prefix">avatar@devbox:~/Neural Web App$</span> <span class="term-cursor">|</span>`;
+    }
+  });
+
+  // Dismiss pet and summon card events
+  $("hidePetBtn")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const petContainer = $("virtualPetContainer");
+    if (petContainer) petContainer.style.display = "none";
+    log("[info] AVATAR Bot hidden from workspace.");
+  });
+
+  const botSummon = document.querySelector(".bot-header-left");
+  if (botSummon) {
+    botSummon.style.cursor = "pointer";
+    botSummon.addEventListener("click", () => {
+      const petContainer = $("virtualPetContainer");
+      if (petContainer) {
+        petContainer.style.display = "flex";
+        log("[info] AVATAR Bot summoned to workspace.");
+      }
+    });
+  }
+}
+
+require.config({ paths: { vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs" } });
+require(["vs/editor/editor.main"], async () => {
+  monaco.editor.defineTheme("avatar-dark", {
+    base: "vs-dark",
+    inherit: true,
+    rules: [
+      { token: "comment", foreground: "6d8fa3", fontStyle: "italic" },
+      { token: "keyword", foreground: "00e5ff", fontStyle: "bold" },
+      { token: "string", foreground: "f6c45f" },
+      { token: "number", foreground: "7ef9ff" },
+      { token: "type", foreground: "9afaff" },
+      { token: "function", foreground: "8be9fd" },
+    ],
+    colors: {
+      "editor.background": "#040d18",
+      "editorLineNumber.foreground": "#3f7185",
+      "editorLineNumber.activeForeground": "#00e5ff",
+      "editorCursor.foreground": "#00e5ff",
+      "editor.selectionBackground": "#1c6d8966",
+      "editorGutter.background": "#040d18",
+      "editor.lineHighlightBackground": "#0a1a2a88",
+      "minimap.background": "#040d18",
+    },
+  });
+
+  const initialModel = monaco.editor.createModel(
+    "# AVATAR workspace ready.\\n# Enter filename and click Save File or press Ctrl+S to save code.\\nprint('Hello from AVATAR')\\n",
+    "python",
+    monaco.Uri.parse("file:///untitled.py")
+  );
+  state.openFiles.push({ path: "untitled.py", model: initialModel, language: "python" });
+  state.currentFile = "untitled.py";
+
+  editor = monaco.editor.create($("editor"), {
+    model: initialModel,
+    theme: "avatar-dark",
+    automaticLayout: true,
+    minimap: { enabled: true, scale: 1, showSlider: "mouseover" },
+    glyphMargin: true,
+    fontSize: 14,
+    fontFamily: "Cascadia Code, Consolas, monospace",
+    padding: { top: 16 },
+    scrollBeyondLastLine: false,
+  });
+  renderEditorTabs();
+
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KEY_S, () => saveWorkspaceCode("keyboard"));
+  editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.KEY_K, () => {
+    if (typeof window.showInputOverlay === "function") {
+      window.showInputOverlay();
+    }
+  });
+
+  bindUi();
+
+  await loadModels();
+  
+  // Register global Ctrl+S / Cmd+S and F5 keydown event handlers
+  
+  window.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+      event.preventDefault();
+      saveWorkspaceCode("keyboard");
+    }
+    if (event.altKey && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      if (typeof window.showInputOverlay === "function") {
+        window.showInputOverlay();
+      }
+    }
+  });
+
+  $("fixProjectButton")?.addEventListener("click", fixEntireProject);
+  $("newFileBtn")?.addEventListener("click", createNewWorkspaceFile);
+  $("newFolderBtn")?.addEventListener("click", createNewWorkspaceFolder);
+
+  loadModels();
+  fetchWorkspaceFiles();
+  loadProjectRequirements();
+
+  setStatus("Standby");
+});
+
+async function createNewWorkspaceFile() {
+  const name = prompt("Enter new file path (e.g. app.py or folder/app.py):");
+  if (!name) return;
+  try {
+    const res = await fetch(`/api/workspace/create_file?project_id=${encodeURIComponent(state.project || "")}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: name })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    await fetchWorkspaceFiles();
+    openFile(name);
+  } catch(e) {
+    alert("Failed to create file: " + e.message);
+  }
+}
+
+async function createNewWorkspaceFolder() {
+  const name = prompt("Enter new folder path (e.g. src/components):");
+  if (!name) return;
+  try {
+    const res = await fetch(`/api/workspace/create_folder?project_id=${encodeURIComponent(state.project || "")}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: name })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    await fetchWorkspaceFiles();
+  } catch(e) {
+    alert("Failed to create folder: " + e.message);
+  }
+}
+
+async function fetchWorkspaceFiles() {
+  try {
+    const response = await fetch(`/api/workspace/files?project_id=${encodeURIComponent(state.project || "")}`);
+    const data = await response.json();
+    state.workspaceFiles = data.files || [];
+    renderFileTree(state.workspaceFiles, $("fileTree"));
+  } catch (error) {
+    log(`[!] Failed to load workspace files: ${error.message}`);
+    $("fileTree").innerHTML = "<li>Error loading files</li>";
+  }
+}
+
+async function fetchProjects() {
+  try {
+    const response = await fetch("/api/workspace/projects");
+    const data = await response.json();
+    const select = $("projectSelect");
+    if (select) {
+      select.replaceChildren();
+      const defaultOpt = document.createElement("option");
+      defaultOpt.textContent = "Default Workspace";
+      defaultOpt.value = "";
+      select.appendChild(defaultOpt);
+      
+      data.projects.forEach(p => {
+        const option = document.createElement("option");
+        option.textContent = p;
+        option.value = p;
+        select.appendChild(option);
+      });
+      select.value = state.project || "";
+    }
+  } catch (err) {
+    console.error("Failed to load projects:", err);
+  }
+}
+
+function renderFileTree(nodes, container, depth = 0) {
+  container.replaceChildren();
+  nodes.forEach(node => {
+    const li = document.createElement("li");
+    if (node.is_dir) {
+      li.className = "folder";
+      const item = document.createElement("div");
+      item.className = "file-item";
+      item.style.display = "flex";
+      item.style.alignItems = "center";
+      item.innerHTML = `
+        <span class="file-icon">📁</span>
+        <span>${node.name}</span>
+        <span class="file-actions" style="margin-left: auto; display: none; gap: 4px;">
+          <button class="file-act-btn-mini" onclick="renameResource('${node.path.replace(/'/g, "\\'")}', event)" title="Rename" style="background:none;border:none;cursor:pointer;font-size:10px;">✏️</button>
+          <button class="file-act-btn-mini" onclick="deleteResource('${node.path.replace(/'/g, "\\'")}', event)" title="Delete" style="background:none;border:none;cursor:pointer;font-size:10px;">🗑️</button>
+        </span>
+      `;
+      item.onclick = (e) => {
+        if (e.target.closest(".file-act-btn-mini")) return;
+        const ul = li.querySelector("ul");
+        if (ul) ul.style.display = ul.style.display === "none" ? "block" : "none";
+      };
+      
+      item.onmouseenter = () => { item.querySelector(".file-actions").style.display = "flex"; };
+      item.onmouseleave = () => { item.querySelector(".file-actions").style.display = "none"; };
+      
+      li.appendChild(item);
+      const ul = document.createElement("ul");
+      renderFileTree(node.children || [], ul, depth + 1);
+      li.appendChild(ul);
+    } else {
+      li.className = "file";
+      const item = document.createElement("div");
+      item.className = "file-item";
+      item.style.display = "flex";
+      item.style.alignItems = "center";
+      item.innerHTML = `
+        <span class="file-icon">📄</span>
+        <span>${node.name}</span>
+        <span class="file-actions" style="margin-left: auto; display: none; gap: 4px;">
+          <button class="file-act-btn-mini" onclick="renameResource('${node.path.replace(/'/g, "\\'")}', event)" title="Rename" style="background:none;border:none;cursor:pointer;font-size:10px;">✏️</button>
+          <button class="file-act-btn-mini" onclick="deleteResource('${node.path.replace(/'/g, "\\'")}', event)" title="Delete" style="background:none;border:none;cursor:pointer;font-size:10px;">🗑️</button>
+        </span>
+      `;
+      item.onclick = (e) => {
+        if (e.target.closest(".file-act-btn-mini")) return;
+        openFile(node.path);
+      };
+      if (state.currentFile === node.path) {
+        item.classList.add("active");
+      }
+      
+      item.onmouseenter = () => { item.querySelector(".file-actions").style.display = "flex"; };
+      item.onmouseleave = () => { item.querySelector(".file-actions").style.display = "none"; };
+      
+      li.appendChild(item);
+    }
+    container.appendChild(li);
+  });
+}
+
+async function openFile(path) {
+  try {
+    setStatus(`Loading ${path}`, true);
+    
+    let fileObj = state.openFiles.find(f => f.path === path);
+    if (!fileObj) {
+      const response = await fetch(`/api/workspace/file?path=${encodeURIComponent(path)}&project_id=${encodeURIComponent(state.project || "")}`);
+      if (!response.ok) throw new Error("Failed to load file");
+      const data = await response.json();
+      
+      const ext = path.split('.').pop().toLowerCase();
+      const extToLang = {
+        "py": "python", "js": "javascript", "ts": "typescript",
+        "html": "html", "css": "css", "json": "json", "md": "auto",
+        "sql": "sql", "sh": "bash", "yml": "yaml", "yaml": "yaml",
+        "rs": "rust", "cpp": "cpp", "cc": "cpp", "cxx": "cpp"
+      };
+      let lang = extToLang[ext] || "auto";
+      if (lang === "auto") lang = "python";
+      else lang = MONACO_LANGUAGE_MAP[lang] || "python";
+
+      const model = monaco.editor.createModel(data.content, lang, monaco.Uri.parse("file:///" + path.replace(/\\\\/g, "/")));
+      fileObj = { path, model, language: lang };
+      state.openFiles.push(fileObj);
+    }
+    
+    switchTab(path);
+    renderFileTree(state.workspaceFiles, $("fileTree"));
+    setStatus("Idle");
+  } catch (err) {
+    log(`[!] Error opening file: ${err.message}`);
+    setStatus("Error");
+  }
+}
+
+function switchTab(path) {
+  state.currentFile = path;
+  $("saveFilenameInput").value = path;
+  
+  const fileObj = state.openFiles.find(f => f.path === path);
+  if (fileObj) {
+    editor.setModel(fileObj.model);
+    state.language = fileObj.language;
+    const uiLang = Object.keys(MONACO_LANGUAGE_MAP).find(k => MONACO_LANGUAGE_MAP[k] === fileObj.language) || "python";
+    $("languageSelect").value = uiLang;
+  }
+  
+  renderEditorTabs();
+}
+
+function closeFile(path, event) {
+  if (event) event.stopPropagation();
+  
+  const index = state.openFiles.findIndex(f => f.path === path);
+  if (index === -1) return;
+  
+  const fileObj = state.openFiles[index];
+  fileObj.model.dispose(); // Free memory
+  state.openFiles.splice(index, 1);
+  
+  if (state.openFiles.length === 0) {
+    state.currentFile = null;
+    editor.setModel(null);
+    $("saveFilenameInput").value = "";
+  } else if (state.currentFile === path) {
+    const nextIndex = index < state.openFiles.length ? index : index - 1;
+    switchTab(state.openFiles[nextIndex].path);
+  } else {
+    renderEditorTabs();
+  }
+}
+
+function renderEditorTabs() {
+  const container = $("editorTabs");
+  if (!container) return;
+  container.replaceChildren();
+  
+  state.openFiles.forEach(fileObj => {
+    const tab = document.createElement("div");
+    tab.className = "editor-tab" + (state.currentFile === fileObj.path ? " active" : "");
+    tab.onclick = () => switchTab(fileObj.path);
+    
+    const nameSpan = document.createElement("span");
+    nameSpan.textContent = fileObj.path.split(/[\\\\/]/).pop() || fileObj.path;
+    
+    const closeBtn = document.createElement("div");
+    closeBtn.className = "editor-tab-close";
+    closeBtn.innerHTML = "×";
+    closeBtn.onclick = (e) => closeFile(fileObj.path, e);
+    
+    tab.appendChild(nameSpan);
+    tab.appendChild(closeBtn);
+    container.appendChild(tab);
+  });
+}
+
+async function fixEntireProject() {
+  setStatus("Repairing Project", true);
+  setProgress(5);
+  
+  try {
+    const response = await fetch("/api/tasks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: "code_generation",
+        prompt: "Review and heal all bugs in this project.",
+        project_id: ""
+      })
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      startDashboardPolling(data.task_id);
+    } else {
+      const err = await response.text();
+      log(`[!] Failed to start project repair: ${err}`);
+    }
+  } catch (e) {
+    setStatus("Repair failed");
+    log(`[!] Project repair failed: ${e.message}`);
+  }
+}
+
+function updateFilenameExtension(language) {
+  const input = $("saveFilenameInput");
+  const filename = input.value.trim();
+  const extMap = {
+    python: ".py",
+    javascript: ".js",
+    typescript: ".ts",
+    jsx: ".jsx",
+    react: ".tsx",
+    html: ".html",
+    css: ".css",
+    json: ".json",
+    java: ".java",
+    kotlin: ".kt",
+    csharp: ".cs",
+    go: ".go",
+    rust: ".rs",
+    c: ".c",
+    cpp: ".cpp",
+    ruby: ".rb",
+    php: ".php",
+    sql: ".sql",
+    bash: ".sh",
+    powershell: ".ps1",
+    r: ".r",
+    lua: ".lua",
+    scala: ".scala",
+    swift: ".swift"
+  };
+  
+  const targetExt = extMap[language];
+  if (!targetExt) return;
+  
+  if (!filename) {
+    const baseNames = {
+      html: "index.html",
+      css: "styles.css",
+      javascript: "index.js",
+      json: "config.json"
+    };
+    input.value = baseNames[language] || `app${targetExt}`;
+  } else {
+    const lastDot = filename.lastIndexOf(".");
+    if (lastDot === -1) {
+      input.value = filename + targetExt;
+    } else {
+      const ext = filename.substring(lastDot).toLowerCase();
+      if (ext !== targetExt) {
+        input.value = filename.substring(0, lastDot) + targetExt;
+      }
+    }
+  }
+}
+
+// --- Advanced Virtual Pet Physics & Gestures ---
+function initVirtualPet() {
+  const container = document.getElementById('virtualPetContainer');
+  const pet = document.getElementById('virtualPet');
+  const pupils = document.querySelectorAll('.pupil');
+  const bubble = document.getElementById('petBubble');
+  if (!container || !pet || pupils.length === 0) return;
+
+  let bubbleTimeout = null;
+
+  function dismissBubble() {
+    if (state.chatStreaming) return;
+    if (bubble && !bubble.classList.contains("hidden")) {
+      bubble.style.opacity = "0";
+      bubble.style.pointerEvents = "none";
+      setTimeout(() => bubble.classList.add("hidden"), 300);
+    }
+  }
+
+  function showBubble(text, duration = 4000) {
+    if (!bubble) return;
+    const textEl = bubble.querySelector('.bubble-text');
+    if (textEl) textEl.innerHTML = text;
+    bubble.classList.remove('hidden');
+    bubble.style.opacity = "1";
+    bubble.style.pointerEvents = "auto";
+    
+    if (bubbleTimeout) clearTimeout(bubbleTimeout);
+    bubbleTimeout = setTimeout(() => {
+      dismissBubble();
+    }, duration);
+  }
+
+  // Hidden Affection & Memory local database
+  let affection = parseInt(localStorage.getItem('avatar_affection') || '0', 10);
+  let petCount = parseInt(localStorage.getItem('avatar_pet_count') || '0', 10);
+  let successes = parseInt(localStorage.getItem('avatar_success_count') || '0', 10);
+
+  function saveAffection() {
+    localStorage.setItem('avatar_affection', affection);
+    localStorage.setItem('avatar_pet_count', petCount);
+    localStorage.setItem('avatar_success_count', successes);
+  }
+
+  function recordInteraction() {
+    petCount++;
+    if (petCount % 4 === 0) {
+      affection++;
+    }
+    saveAffection();
+  }
+
+  // Web Audio Synth Function
+  function playPetSound(type) {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      
+      const playTone = (freq, duration, type = 'sine', startTime = 0) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, ctx.currentTime + startTime);
+        gain.gain.setValueAtTime(0.08, ctx.currentTime + startTime);
+        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + startTime + duration);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(ctx.currentTime + startTime);
+        osc.stop(ctx.currentTime + startTime + duration);
+      };
+
+      if (type === 'happy') {
+        playTone(880, 0.12, 'triangle', 0);
+        playTone(1320, 0.18, 'triangle', 0.08);
+      } else if (type === 'sad') {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.frequency.setValueAtTime(440, ctx.currentTime);
+        osc.frequency.linearRampToValueAtTime(220, ctx.currentTime + 0.35);
+        gain.gain.setValueAtTime(0.08, ctx.currentTime);
+        gain.gain.linearRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.35);
+      } else if (type === 'angry') {
+        for (let i = 0; i < 5; i++) {
+          playTone(120 + Math.random() * 40, 0.05, 'sawtooth', i * 0.06);
+        }
+      } else if (type === 'blush') {
+        playTone(523.25, 0.08, 'sine', 0);
+        playTone(659.25, 0.08, 'sine', 0.06);
+        playTone(783.99, 0.08, 'sine', 0.12);
+        playTone(1046.50, 0.12, 'sine', 0.18);
+      } else if (type === 'flip' || type === 'jump') {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(350, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(950, ctx.currentTime + 0.3);
+        gain.gain.setValueAtTime(0.08, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.3);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.3);
+      }
+    } catch (e) {
+      console.warn("Audio Context blocked or failed:", e);
+    }
+  }
+
+  function spawnParticles(emoji, count = 6) {
+    const rect = container.getBoundingClientRect();
+    for (let i = 0; i < count; i++) {
+      const p = document.createElement('div');
+      p.textContent = emoji;
+      p.style.position = 'fixed';
+      p.style.left = (rect.left + rect.width / 2 + (Math.random() - 0.5) * 40) + 'px';
+      p.style.top = (rect.top + (Math.random() - 0.5) * 20) + 'px';
+      p.style.fontSize = '22px';
+      p.style.zIndex = '3000';
+      p.style.pointerEvents = 'none';
+      p.style.transition = 'all 0.9s cubic-bezier(0.25, 1, 0.5, 1)';
+      document.body.appendChild(p);
+
+      setTimeout(() => {
+        p.style.transform = `translate(${(Math.random() - 0.5) * 60}px, -90px) scale(1.5)`;
+        p.style.opacity = '0';
+      }, 30);
+
+      setTimeout(() => p.remove(), 950);
+    }
+  }
+
+  // Physics & Position State (Persisted)
+  const editorZone = document.querySelector('.editor-zone');
+  
+  let savedX = localStorage.getItem('avatar_pet_x');
+  let savedY = localStorage.getItem('avatar_pet_y');
+  let x = savedX !== null ? parseFloat(savedX) : 100;
+  let y = savedY !== null ? parseFloat(savedY) : 120;
+
+  if (editorZone) {
+    const rightLimit = editorZone.clientWidth - 150;
+    const bottomLimit = editorZone.clientHeight - 120;
+    x = Math.max(50, Math.min(rightLimit, x));
+    y = Math.max(50, Math.min(bottomLimit, y));
+  }
+
+  let baseX = x;
+  let baseY = y;
+  
+  let vx = 0;
+  let vy = 0;
+  let friction = 0.85;
+  let isGliding = false;
+  
+  let isDragging = false;
+  let dragOffsetX = 0;
+  let dragOffsetY = 0;
+  let lastMouseX = 0;
+  let lastMouseY = 0;
+  let rotation = 0;
+  let vr = 0;
+  let dragStartTime = 0;
+
+  let state = 'idle';
+  let stateTimer = null;
+  let idleTimeout = null;
+  const IDLE_TIME = 15000;
+
+  // Perching & Follow Mode State
+  let followMode = false;
+  let isPerched = false;
+  let mouseX = 0;
+  let mouseY = 0;
+
+  container.style.left = x + 'px';
+  container.style.top = y + 'px';
+
+  function setState(newState, duration = 0) {
+    if (state === newState) return;
+
+    pet.classList.remove('jump-hop', 'flip-spin');
+    const allStates = ['idle', 'happy', 'blush', 'thinking', 'sleeping', 'excited', 'shocked', 'confused', 'dragged'];
+    allStates.forEach(s => pet.classList.remove(s));
+    
+    pet.classList.add(newState);
+    state = newState;
+
+    if (newState === 'happy') playPetSound('happy');
+    if (newState === 'sad') playPetSound('sad');
+    if (newState === 'angry') playPetSound('angry');
+    if (newState === 'blush') playPetSound('blush');
+    if (newState === 'excited') playPetSound('happy');
+    if (newState === 'shocked') playPetSound('sad');
+
+    if (stateTimer) clearTimeout(stateTimer);
+    if (duration > 0) {
+      stateTimer = setTimeout(() => {
+        setState('idle');
+        resetIdle();
+      }, duration);
+    }
+  }
+
+  function resetIdle() {
+    if (state !== 'idle' && state !== 'sleeping') return;
+    if (state === 'sleeping') {
+      setState('idle');
+    }
+    clearTimeout(idleTimeout);
+    idleTimeout = setTimeout(() => {
+      if (state === 'idle') setState('sleeping');
+    }, IDLE_TIME);
+  }
+
+  // --- Perch Wander Logic ---
+  function getPerchSpot() {
+    const spots = [];
+    const tabs = document.querySelector('.editor-tabs-container');
+    if (tabs) spots.push({ name: 'editor tabs', el: tabs, offset: { x: 220, y: -8 } });
+    
+    const sidebar = document.querySelector('.sidebar-panel');
+    if (sidebar) spots.push({ name: 'sidebar edge', el: sidebar, offset: { x: sidebar.clientWidth - 15, y: 140 } });
+
+    const terminal = document.querySelector('.bottom-tabs-header');
+    if (terminal) spots.push({ name: 'terminal header', el: terminal, offset: { x: 150, y: -52 } });
+    
+    if (spots.length === 0) return null;
+    return spots[Math.floor(Math.random() * spots.length)];
+  }
+
+  function triggerPerch() {
+    if (followMode || isDragging || isGliding) return;
+    const spot = getPerchSpot();
+    if (spot) {
+      const rect = spot.el.getBoundingClientRect();
+      const editorRect = document.querySelector('.editor-zone').getBoundingClientRect();
+      
+      baseX = (rect.left - editorRect.left) + spot.offset.x;
+      baseY = (rect.top - editorRect.top) + spot.offset.y;
+      
+      isPerched = true;
+      
+      const perchPrompts = [
+        "Sitting comfortable right here.",
+        "Nice view of your workspace from up here!",
+        "Just perching... keeping an eye on variables.",
+        "Perching mode activated! 🐦"
+      ];
+      showBubble(perchPrompts[Math.floor(Math.random() * perchPrompts.length)], 3500);
+      setState('happy', 2000);
+    }
+  }
+
+  // Global speak access for compiler tasks
+  window.avatarSpeak = function(message, type = 'info') {
+    if (window.evaBot && typeof window.evaBot.speak === 'function') {
+      window.evaBot.speak(message, type);
+    } else {
+      // Fallback behavior
+      showBubble(message, 5000);
+      if (type === 'success') {
+        setState('excited', 2500);
+        spawnParticles('🎉', 5);
+        affection += 2;
+      } else if (type === 'error') {
+        setState('shocked', 3000);
+        spawnParticles('⚠️', 3);
+      } else if (type === 'thinking') {
+        setState('thinking', 4000);
+      }
+    }
+  };
+
+  // Memory Greet on reload
+  function memoryGreet() {
+    const now = Date.now();
+    const lastActiveStr = localStorage.getItem('avatar_last_active');
+    const lastActive = lastActiveStr ? parseInt(lastActiveStr, 10) : 0;
+    localStorage.setItem('avatar_last_active', now.toString());
+
+    let greet = "Hey! I'm AVA 👋 Let's build something awesome.";
+    if (lastActive > 0) {
+      const hoursDiff = (now - lastActive) / (1000 * 60 * 60);
+      if (hoursDiff < 24) {
+        greet = "Nice to see you again! Ready for another coding sprint?";
+        if (successes > 2) {
+          greet = `Welcome back! Already ${successes} task completions recorded today. Keep it up!`;
+        }
+      } else if (hoursDiff < 48) {
+        greet = "Welcome back! We made some great progress yesterday.";
+      }
+    }
+    
+    if (affection > 20) {
+      greet = "Hello, companion! 💖 Always a pleasure coding by your side.";
+    }
+    
+    showBubble(greet, 6000);
+  }
+
+  // Physics Loop
+  let physicsFrame = null;
+  let lastRenderedX = NaN;
+  let lastRenderedY = NaN;
+  let lastRenderedRotation = NaN;
+
+  function updatePhysics() {
+    if (document.hidden) {
+      physicsFrame = requestAnimationFrame(updatePhysics);
+      return;
+    }
+
+    const rightLimit = (editorZone ? editorZone.clientWidth : window.innerWidth) - 150;
+    const bottomLimit = (editorZone ? editorZone.clientHeight : window.innerHeight) - 120;
+
+    if (followMode && !isDragging) {
+      baseX = Math.max(20, Math.min(rightLimit, mouseX + 60));
+      baseY = Math.max(20, Math.min(bottomLimit, mouseY + 40));
+    }
+
+    if (!isDragging) {
+      if (isGliding) {
+        vx *= friction;
+        vy *= friction;
+        x += vx;
+        y += vy;
+        rotation += vr;
+        vr *= 0.95;
+
+        if (x < 10) { x = 10; vx *= -0.7; vr = -vx; }
+        if (x > rightLimit) { x = rightLimit; vx *= -0.7; vr = -vx; }
+        if (y < 10) { y = 10; vy *= -0.7; vr = vx; }
+        if (y > bottomLimit) { y = bottomLimit; vy *= -0.7; vr = -vx; }
+
+        if (Math.abs(vx) < 0.25 && Math.abs(vy) < 0.25) {
+          isGliding = false;
+          baseX = x;
+          baseY = y;
+          vx = 0;
+          vy = 0;
+          localStorage.setItem('avatar_pet_x', x);
+          localStorage.setItem('avatar_pet_y', y);
+        }
+      } else {
+        baseX = Math.max(10, Math.min(rightLimit, baseX));
+        baseY = Math.max(10, Math.min(bottomLimit, baseY));
+
+        x += (baseX - x) * 0.08;
+        y += (baseY - y) * 0.08;
+
+        rotation += (0 - rotation) * 0.1;
+      }
+
+      if (
+        Math.abs(x - lastRenderedX) > 0.2 ||
+        Math.abs(y - lastRenderedY) > 0.2 ||
+        Math.abs(rotation - lastRenderedRotation) > 0.2
+      ) {
+        container.style.left = x + 'px';
+        container.style.top = y + 'px';
+        container.style.transform = `rotate(${rotation}deg)`;
+        lastRenderedX = x;
+        lastRenderedY = y;
+        lastRenderedRotation = rotation;
+      }
+    }
+
+    physicsFrame = requestAnimationFrame(updatePhysics);
+  }
+  physicsFrame = requestAnimationFrame(updatePhysics);
+  window.addEventListener('beforeunload', () => {
+    if (physicsFrame) cancelAnimationFrame(physicsFrame);
+  });
+
+  // Mouse & Gesture Event Listeners
+  container.addEventListener('mousedown', (e) => {
+    if (e.button === 2) return; 
+    
+    if (!e.target.closest('#petInteractDrag')) {
+      return; 
+    }
+
+    dismissBubble();
+    isDragging = true;
+    isGliding = false;
+    isPerched = false;
+    dragStartTime = Date.now();
+    setState('dragged');
+    
+    dragOffsetX = e.clientX - x;
+    dragOffsetY = e.clientY - y;
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+    vx = 0;
+    vy = 0;
+    vr = 0;
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    resetIdle();
+    
+    const editorRect = editorZone ? editorZone.getBoundingClientRect() : { left: 0, top: 0 };
+    mouseX = e.clientX - editorRect.left;
+    mouseY = e.clientY - editorRect.top;
+
+    if (isDragging) {
+      x = e.clientX - dragOffsetX;
+      y = e.clientY - dragOffsetY;
+      container.style.left = x + 'px';
+      container.style.top = y + 'px';
+
+      vx = e.clientX - lastMouseX;
+      vy = e.clientY - lastMouseY;
+      vr = vx * 0.4;
+      
+      rotation += (vr - rotation) * 0.25;
+      container.style.transform = `rotate(${rotation}deg)`;
+
+      lastMouseX = e.clientX;
+      lastMouseY = e.clientY;
+    } else {
+      if (isPerched) {
+        const petRect = container.getBoundingClientRect();
+        const dist = Math.sqrt(Math.pow(e.clientX - (petRect.left + 32), 2) + Math.pow(e.clientY - (petRect.top + 32), 2));
+        if (dist < 80) {
+          isPerched = false;
+          baseX = x;
+          baseY = y;
+          setState('idle');
+        }
+      }
+
+      if (['idle', 'dragged', 'happy', 'blush', 'sad', 'angry', 'thinking', 'excited', 'confused'].includes(state)) {
+        const petRect = container.getBoundingClientRect();
+        const petCenterX = petRect.left + petRect.width / 2;
+        const petCenterY = petRect.top + petRect.height / 2;
+
+        const dx = e.clientX - petCenterX;
+        const dy = e.clientY - petCenterY;
+        const angle = Math.atan2(dy, dx) - (rotation * Math.PI / 180);
+        const distance = Math.min(2.5, Math.sqrt(dx*dx + dy*dy) / 80);
+
+        const px = Math.cos(angle) * distance;
+        const py = Math.sin(angle) * distance;
+
+        pupils.forEach(pupil => {
+          pupil.style.transform = `translate(${px}px, ${py}px)`;
+        });
+
+        const petHead = pet.querySelector('.pet-head');
+        if (petHead) {
+          const maxTilt = 8;
+          const tilt = Math.min(maxTilt, Math.sqrt(dx*dx + dy*dy) / 60) * Math.cos(angle);
+          petHead.style.transform = `rotate(${tilt}deg)`;
+        }
+      }
+    }
+  });
+
+  window.addEventListener('mouseup', (e) => {
+    if (isDragging) {
+      isDragging = false;
+      
+      const clickDuration = Date.now() - dragStartTime;
+      const mouseDist = Math.sqrt(vx*vx + vy*vy);
+
+      if (clickDuration < 200 && mouseDist < 5) {
+        pet.classList.add('jump-hop');
+        playPetSound('jump');
+        setState('happy', 2000);
+        spawnParticles('💖', 4);
+        recordInteraction();
+        
+        setTimeout(() => {
+          pet.classList.remove('jump-hop');
+        }, 400);
+
+        baseX = x;
+        baseY = y;
+      } else {
+        if (mouseDist > 10) {
+          isGliding = true;
+          vx = Math.max(-25, Math.min(25, vx));
+          vy = Math.max(-25, Math.min(25, vy));
+        } else {
+          baseX = x;
+          baseY = y;
+          setState('idle');
+          localStorage.setItem('avatar_pet_x', x);
+          localStorage.setItem('avatar_pet_y', y);
+        }
+      }
+    }
+  });
+
+  pet.addEventListener('click', (e) => {
+    e.stopPropagation();
+    dismissBubble();
+    pet.classList.add('jump-hop');
+    playPetSound('jump');
+    setState('happy', 2000);
+    spawnParticles('💖', 4);
+    recordInteraction();
+    setTimeout(() => pet.classList.remove('jump-hop'), 400);
+  });
+
+  function showInputOverlay(prefill = "") {
+    const overlay = document.getElementById("petInputOverlay");
+    const textarea = document.getElementById("petInputText");
+    if (overlay && textarea) {
+      dismissBubble();
+      overlay.classList.remove("hidden");
+      textarea.value = prefill;
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+      setState('thinking', 3000);
+    }
+  }
+
+  function hideInputOverlay() {
+    const overlay = document.getElementById("petInputOverlay");
+    if (overlay) {
+      overlay.classList.add("hidden");
+    }
+  }
+
+  window.showInputOverlay = showInputOverlay;
+  window.hideInputOverlay = hideInputOverlay;
+
+  function runPetCommand(rawCommand) {
+    const command = rawCommand.trim();
+    if (!command) return;
+
+    const lower = command.toLowerCase();
+    hideInputOverlay();
+    dismissBubble();
+    resetIdle();
+
+    if (lower === "/review" || lower === "review") {
+      showBubble("Reviewing the active code now.", 2400);
+      setState('thinking', 2500);
+      reviewCode();
+      return;
+    }
+    if (lower === "/fix" || lower === "fix") {
+      showBubble("Repair pass started.", 2400);
+      setState('thinking', 2500);
+      fixCode();
+      return;
+    }
+    if (lower === "/save" || lower === "save") {
+      showBubble("Saving the workspace file.", 2400);
+      setState('happy', 2000);
+      saveWorkspaceCode("pet");
+      return;
+    }
+    if (lower === "/follow" || lower === "follow") {
+      toggleFollowMode();
+      return;
+    }
+    if (lower === "/perch" || lower === "perch") {
+      triggerPerch();
+      return;
+    }
+    if (lower === "/help" || lower === "help") {
+      showBubble("Try /review, /fix, /save, /follow, /perch, or ask a coding question.", 7000);
+      setState('happy', 2500);
+      return;
+    }
+
+    setState('thinking', 3000);
+    sendChat(command);
+  }
+
+  const inputOverlayTextarea = document.getElementById("petInputText");
+  if (inputOverlayTextarea) {
+    inputOverlayTextarea.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey) {
+        e.preventDefault();
+        runPetCommand(inputOverlayTextarea.value);
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        hideInputOverlay();
+      }
+    });
+  }
+
+  document.addEventListener("click", (e) => {
+    if (e.target.closest("#virtualPetContainer")) return;
+    hideInputOverlay();
+  });
+
+  pet.addEventListener('dblclick', (e) => {
+    e.stopPropagation();
+    showInputOverlay();
+  });
+
+  pet.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    showInputOverlay();
+  });
+
+  function toggleFollowMode() {
+    followMode = !followMode;
+    isPerched = false;
+    container.classList.toggle('follow-mode', followMode);
+    showBubble(followMode ? "Follow mode on. I will stay near your cursor." : "Follow mode off. I will stay put.", 3200);
+    setState(followMode ? 'excited' : 'idle', 2200);
+  }
+
+  function bindPetButton(id, action) {
+    const button = document.getElementById(id);
+    if (!button) return;
+    button.addEventListener('click', (e) => {
+      e.stopPropagation();
+      action();
+      recordInteraction();
+    });
+  }
+
+  bindPetButton('petInteractAsk', () => showInputOverlay());
+  bindPetButton('petInteractReview', () => runPetCommand('/review'));
+  bindPetButton('petInteractFix', () => runPetCommand('/fix'));
+  bindPetButton('petInteractSave', () => runPetCommand('/save'));
+  bindPetButton('petInteractFollow', toggleFollowMode);
+  bindPetButton('petInteractPerch', triggerPerch);
+
+  window.addEventListener('keydown', (e) => {
+    if (document.activeElement.tagName === 'INPUT' || 
+        document.activeElement.tagName === 'TEXTAREA' || 
+        document.activeElement.closest('.monaco-editor') ||
+        document.activeElement.isContentEditable) {
+      return;
+    }
+
+    const key = e.key.toLowerCase();
+    if (key === 's') {
+      dismissBubble();
+      setState('sad', 3000);
+      spawnParticles('😢', 4);
+    } else if (key === 'h') {
+      dismissBubble();
+      pet.classList.add('jump-hop');
+      setState('happy', 3000);
+      spawnParticles('⭐', 5);
+      setTimeout(() => pet.classList.remove('jump-hop'), 400);
+    } else if (key === 'f') {
+      dismissBubble();
+      pet.classList.add('flip-spin');
+      playPetSound('flip');
+      spawnParticles('✨', 6);
+      setState('happy', 3000);
+      setTimeout(() => {
+        pet.classList.remove('flip-spin');
+      }, 600);
+    }
+  });
+
+  let lastActivity = Date.now();
+  
+  function checkIdleWander() {
+    const now = Date.now();
+    if (now - lastActivity > 12000 && !isPerched && !followMode && !isDragging) {
+      triggerPerch();
+    }
+  }
+
+  function friendlyChatter() {
+    if (state === 'sleeping' || followMode) return;
+    const idleChats = [
+      "Need any help with the code?",
+      "Looking good! Nice and structured.",
+      "That's an interesting approach.",
+      "Writing a lot of code today! Keep it up.",
+      "Let's build something amazing! 🚀",
+      "Ava is standby. Use the bot controls for review, fix, save, or follow.",
+      "Tip: type /help into my mini command box."
+    ];
+    showBubble(idleChats[Math.floor(Math.random() * idleChats.length)], 4000);
+  }
+
+  setInterval(checkIdleWander, 6000);
+  setInterval(friendlyChatter, 140000);
+
+  window.addEventListener('resize', () => {
+    const rightLimit = (editorZone ? editorZone.clientWidth : window.innerWidth) - 150;
+    const bottomLimit = (editorZone ? editorZone.clientHeight : window.innerHeight) - 120;
+    if (baseX > rightLimit) baseX = rightLimit;
+    if (baseY > bottomLimit) baseY = bottomLimit;
+  });
+
+  window.setVirtualPetState = setState;
+  window.showVirtualPetBubble = (msg, type = 'info', timeout = 4000) => {
+    showBubble(msg, timeout);
+    if (type === 'success') {
+      setState('excited', 2500);
+      spawnParticles('🎉', 5);
+    } else if (type === 'error') {
+      setState('shocked', 3000);
+      spawnParticles('⚠️', 3);
+    } else if (type === 'thinking') {
+      setState('thinking', 4000);
+    }
+  };
+  window.spawnVirtualPetParticles = spawnParticles;
+
+  resetIdle();
+  memoryGreet();
+}
+
+// Robust page initialization
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initVirtualPet);
+} else {
+  initVirtualPet();
+}
+
+
+// Workspace Execution and Agent Control APIs
+let activeTaskId = null;
+let progressPollInterval = null;
+
+async function runWorkspaceCode() {
+  if (!state.currentFile) {
+    alert("Please open a file to run.");
+    return;
+  }
+  
+  // Select terminal tab
+  const termTab = document.querySelector('.bottom-tab[data-panel="terminal"]');
+  if (termTab) termTab.click();
+  
+  const termOutput = $("terminalOutput");
+  if (termOutput) {
+    termOutput.innerHTML = `<span class="term-dim">[AVATAR] Executing ${state.currentFile.path}...</span><br>`;
+  }
+  
+  try {
+    const response = await fetch("/api/workspace/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: state.currentFile.path })
+    });
+    
+    if (response.ok) {
+      const result = await response.json();
+      if (termOutput) {
+        let cmd = state.currentFile.path.endsWith('.py') ? 'python' : 'node';
+        let html = `<span class="term-prefix">avatar@devbox:~/Neural Web App$</span> ${cmd} ${state.currentFile.path}<br>`;
+        if (result.stdout) {
+          html += `<span class="term-dim">${escapeHtml(result.stdout)}</span>`;
+        }
+        if (result.stderr) {
+          html += `<span style="color: #ef4444">${escapeHtml(result.stderr)}</span>`;
+        }
+        html += `<br><span class="term-dim">[Process completed with exit code ${result.exit_code} in ${result.duration}s]</span><br><span class="term-cursor">|</span>`;
+        termOutput.innerHTML = html;
+      }
+    } else {
+      const err = await response.text();
+      if (termOutput) {
+        termOutput.innerHTML += `<span style="color: #ef4444">Error running file: ${escapeHtml(err)}</span><br>`;
+      }
+    }
+  } catch (e) {
+    if (termOutput) {
+      termOutput.innerHTML += `<span style="color: #ef4444">Error: ${escapeHtml(e.message)}</span><br>`;
+    }
+  }
+}
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;").replace(/\n/g, "<br>");
+}
+
+async function loadGitCheckpoints() {
+  const list = $("dashCheckpoints");
+  if (!list) return;
+  list.innerHTML = "Loading checkpoints...";
+  
+  try {
+    const res = await fetch("/api/git/checkpoints");
+    if (res.ok) {
+      const data = await res.json();
+      list.innerHTML = "";
+      if (data.checkpoints.length === 0) {
+        list.innerHTML = "<li style='color: var(--text-dim);'>No checkpoints found.</li>";
+        return;
+      }
+      data.checkpoints.forEach(cp => {
+        const li = document.createElement("li");
+        li.style.borderBottom = "1px solid rgba(0,242,254,0.05)";
+        li.style.padding = "4px 0";
+        li.style.display = "flex";
+        li.style.justifyContent = "space-between";
+        li.style.alignItems = "center";
+        
+        const info = document.createElement("span");
+        info.innerHTML = `<strong>${cp.message}</strong> <span style='font-size:10px; color:var(--text-dim);'>(${cp.hash.substring(0,7)})</span>`;
+        
+        const btn = document.createElement("button");
+        btn.textContent = "Rollback";
+        btn.style.padding = "2px 6px";
+        btn.style.fontSize = "10px";
+        btn.style.background = "var(--accent-gold)";
+        btn.style.color = "#000";
+        btn.style.border = "none";
+        btn.style.borderRadius = "2px";
+        btn.style.cursor = "pointer";
+        btn.onclick = () => rollbackToCheckpoint(cp.hash);
+        
+        li.appendChild(info);
+        li.appendChild(btn);
+        list.appendChild(li);
+      });
+    }
+  } catch (e) {
+    list.innerHTML = "Failed to load checkpoints.";
+  }
+}
+
+async function rollbackToCheckpoint(hash) {
+  if (!confirm("Are you sure you want to rollback the entire workspace to this checkpoint? All uncommitted edits will be lost.")) return;
+  try {
+    const res = await fetch("/api/git/rollback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hash })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success) {
+        alert("Rollback successful! Workspace files reverted.");
+        fetchWorkspaceFiles();
+      } else {
+        alert("Rollback failed.");
+      }
+    }
+  } catch (e) {
+    alert("Rollback failed: " + e.message);
+  }
+}
+
+function startDashboardPolling(taskId) {
+  activeTaskId = taskId;
+  if (progressPollInterval) clearInterval(progressPollInterval);
+  
+  // Show Agent Dashboard sidebar panel
+  document.getElementById("ribbonDashboardBtn")?.click();
+  
+  progressPollInterval = setInterval(async () => {
+    if (!activeTaskId) return;
+    try {
+      const res = await fetch(`/api/tasks/${activeTaskId}/progress`);
+      if (res.ok) {
+        const task = await res.json();
+        $("dashProgressPct").textContent = `${task.progress}%`;
+        $("dashStage").textContent = task.status.toUpperCase();
+        $("dashAgent").textContent = task.current_agent;
+        $("dashElapsed").textContent = `${Math.round(task.elapsed_time)}s`;
+        $("dashEstLeft").textContent = task.estimated_remaining_time;
+        $("dashCommand").textContent = task.current_command || "None";
+        
+        // Update circular progress fill
+        const ring = $("dashRingFill");
+        if (ring) {
+          const radius = 34;
+          const circumference = 2 * Math.PI * radius; // ~213.6
+          const offset = circumference - (task.progress / 100) * circumference;
+          ring.style.strokeDasharray = `${circumference} ${circumference}`;
+          ring.style.strokeDashoffset = offset;
+        }
+
+        // Control Center elements
+        const ctrlAgent = $("ctrlActiveAgent");
+        if (ctrlAgent) ctrlAgent.textContent = task.current_agent || "Idle";
+        const ctrlFile = $("ctrlActiveFile");
+        if (ctrlFile) ctrlFile.textContent = task.current_file || "None";
+        const ctrlETA = $("ctrlActiveETA");
+        if (ctrlETA) ctrlETA.textContent = task.eta || task.estimated_remaining_time || "N/A";
+        const ctrlSpeed = $("ctrlActiveSpeed");
+        if (ctrlSpeed) ctrlSpeed.textContent = task.current_command ? "Running" : "Idle";
+
+        // Update pipeline stages
+        if (task.subtasks) {
+          const pipelineLabels = {
+            "stage-rag": "1. Context Retrieval (RAG)",
+            "stage-analyzer": "2. Repo AST Analysis",
+            "stage-plan": "3. Intent Analysis",
+            "stage-architecture": "4. Architecture Design",
+            "stage-git_init": "5. Git Checkpoint",
+            "stage-codegen": "6. File Generation",
+            "stage-security": "7. Security Auditing",
+            "stage-review": "8. Code Quality Review",
+            "stage-tests_gen": "9. Test Suite Generator",
+            "stage-test": "10. Test Execution",
+            "stage-debug": "11. Self-Healing Debug",
+            "stage-docs": "12. Documentation Engine"
+          };
+          task.subtasks.forEach(sub => {
+            let stageId = "stage-" + sub.id;
+            if (sub.id === "planning") stageId = "stage-plan";
+            if (sub.id === "coder") stageId = "stage-codegen";
+            if (sub.id === "testing") stageId = "stage-test";
+            if (sub.id === "documentation") stageId = "stage-docs";
+            if (sub.id === "git_manager") stageId = "stage-git_init";
+
+            const el = document.getElementById(stageId);
+            const label = pipelineLabels[stageId];
+            if (el && label) {
+              if (sub.status === "completed") {
+                el.textContent = `✅ ${label}`;
+                el.style.color = "var(--cyan)";
+              } else if (sub.status === "in_progress") {
+                el.textContent = `⚡ ${label}`;
+                el.style.color = "var(--accent-gold)";
+              } else if (sub.status === "failed") {
+                el.textContent = `❌ ${label}`;
+                el.style.color = "var(--red)";
+              } else {
+                el.textContent = `⚪ ${label}`;
+                el.style.color = "var(--text-dim)";
+              }
+            }
+          });
+        }
+        
+        // Render subtasks checklist
+        const subList = $("dashSubtasks");
+        if (subList && task.subtasks) {
+          subList.innerHTML = "";
+          task.subtasks.forEach(sub => {
+            const li = document.createElement("li");
+            let icon = "⚪";
+            if (sub.status === "completed") icon = "✅";
+            else if (sub.status === "in_progress") icon = "⚡";
+            else if (sub.status === "failed") icon = "❌";
+            li.innerHTML = `${icon} ${sub.title}`;
+            li.style.color = sub.status === "in_progress" ? "var(--accent-cyan)" : (sub.status === "completed" ? "var(--text-color)" : "var(--text-dim)");
+            subList.appendChild(li);
+          });
+        }
+        
+        // Show/hide pause/resume buttons
+        if (task.paused) {
+          $("btnTaskPause").classList.add("hidden");
+          $("btnTaskResume").classList.remove("hidden");
+        } else {
+          $("btnTaskPause").classList.remove("hidden");
+          $("btnTaskResume").classList.add("hidden");
+        }
+        
+        if (task.status === "completed" || task.status === "failed") {
+          clearInterval(progressPollInterval);
+          activeTaskId = null;
+          stopWorkspaceSync();
+          loadGitCheckpoints();
+          await fetchWorkspaceFiles();
+          if (state.currentFile) {
+            state.openFiles = state.openFiles.filter(f => f.path !== state.currentFile);
+            openFile(state.currentFile);
+          } else if (state.workspaceFiles && state.workspaceFiles.length > 0) {
+            const findFirstFile = (nodes) => {
+              for (const n of nodes) {
+                if (!n.is_dir) return n.path;
+                if (n.children) {
+                  const path = findFirstFile(n.children);
+                  if (path) return path;
+                }
+              }
+              return null;
+            };
+            const fPath = findFirstFile(state.workspaceFiles);
+            if (fPath) openFile(fPath);
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Polling error", e);
+    }
+  }, 1500);
+}
+
+// Smart workspace sync – polls file list during active tasks for live file tree refresh
+let _lastFileCount = -1;
+let _wsSyncInterval = null;
+
+function startWorkspaceSync(project_id) {
+  if (_wsSyncInterval) clearInterval(_wsSyncInterval);
+  _lastFileCount = -1;
+  _wsSyncInterval = setInterval(async () => {
+    try {
+      const resp = await fetch(`/api/workspace/sync?project_id=${encodeURIComponent(project_id || "")}`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const count = data.file_count || 0;
+      if (_lastFileCount !== -1 && count !== _lastFileCount) {
+        // File count changed — new files were written. Refresh the tree.
+        await fetchWorkspaceFiles();
+        // If no file is open yet, auto-open the first new code file
+        if (!state.currentFile && data.files && data.files.length > 0) {
+          const firstCode = data.files.find(f =>
+            /\.(py|js|ts|tsx|jsx|html|css|sql|json|md|sh|go|rs|cpp|java|kt)$/.test(f) &&
+            !f.includes("tasks.db")
+          );
+          if (firstCode) openFile(firstCode);
+        }
+      }
+      _lastFileCount = count;
+    } catch (e) {}
+  }, 2500);
+}
+
+function stopWorkspaceSync() {
+  if (_wsSyncInterval) {
+    clearInterval(_wsSyncInterval);
+    _wsSyncInterval = null;
+  }
+  _lastFileCount = -1;
+}
+
+// Control button event listeners and F5 handler
+document.addEventListener("DOMContentLoaded", () => {
+  $("runCodeToolbarBtn")?.addEventListener("click", runWorkspaceCode);
+  
+  // Register keyboard F5 run command
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "F5") {
+      event.preventDefault();
+      runWorkspaceCode();
+    }
+  });
+
+  $("btnTaskPause")?.addEventListener("click", async () => {
+    if (!activeTaskId) return;
+    await fetch(`/api/tasks/${activeTaskId}/control`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paused: true })
+    });
+  });
+  
+  $("btnTaskResume")?.addEventListener("click", async () => {
+    if (!activeTaskId) return;
+    await fetch(`/api/tasks/${activeTaskId}/control`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paused: false })
+    });
+  });
+  
+  $("btnTaskCancel")?.addEventListener("click", async () => {
+    if (!activeTaskId) return;
+    if (confirm("Are you sure you want to cancel the active agent task?")) {
+      await fetch(`/api/tasks/${activeTaskId}/control`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "failed" })
+      });
+      clearInterval(progressPollInterval);
+      activeTaskId = null;
+      $("dashStage").textContent = "FAILED/CANCELLED";
+    }
+  });
+  $("shutdownBtn")?.addEventListener("click", async () => {
+    if (confirm("Are you sure you want to stop and shutdown the AVATAR server?")) {
+      try {
+        const res = await fetch("/api/shutdown", { method: "POST" });
+        if (res.ok) {
+          alert("AVATAR server is shutting down. You can close this window now.");
+          if (window.close) window.close();
+        }
+      } catch (err) {
+        alert("Shutdown request sent.");
+      }
+    }
+  });
+
+  // Telemetry updates
+  $("refreshMetricsBtn")?.addEventListener("click", () => {
+    pollSystemMetrics();
+    pollRepositoryStatus();
+    pollTaskQueue();
+  });
+
+  // Mode select
+  $("executionModeSelect")?.addEventListener("change", async (event) => {
+    const val = event.target.value;
+    try {
+      const res = await fetch("/api/workspace/mode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: val })
+      });
+      if (res.ok) {
+        log(`[ok] Execution mode updated to: ${val}`);
+      }
+    } catch(e) {
+      console.error("Failed to update execution mode:", e);
+    }
+  });
+
+  // Undo and Redo hooks
+  $("undoWorkspaceBtn")?.addEventListener("click", async () => {
+    try {
+      const res = await fetch("/api/workspace/undo", { method: "POST" });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          log(`[ok] Undo successful on ${data.filepath}`);
+          await fetchWorkspaceFiles();
+          if (state.currentFile) {
+            // Force reload opened model content
+            const oldFileObj = state.openFiles.find(f => f.path === state.currentFile);
+            if (oldFileObj) {
+              state.openFiles = state.openFiles.filter(f => f.path !== state.currentFile);
+            }
+            openFile(state.currentFile);
+          }
+        } else {
+          alert("Nothing to undo.");
+        }
+      }
+    } catch(e) {
+      console.error("Undo error:", e);
+    }
+  });
+
+  $("redoWorkspaceBtn")?.addEventListener("click", async () => {
+    try {
+      const res = await fetch("/api/workspace/redo", { method: "POST" });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          log(`[ok] Redo successful on ${data.filepath}`);
+          await fetchWorkspaceFiles();
+          if (state.currentFile) {
+            const oldFileObj = state.openFiles.find(f => f.path === state.currentFile);
+            if (oldFileObj) {
+              state.openFiles = state.openFiles.filter(f => f.path !== state.currentFile);
+            }
+            openFile(state.currentFile);
+          }
+        } else {
+          alert("Nothing to redo.");
+        }
+      }
+    } catch(e) {
+      console.error("Redo error:", e);
+    }
+  });
+
+  // Sync mode state with backend initially
+  (async () => {
+    try {
+      const res = await fetch("/api/workspace/mode");
+      if (res.ok) {
+        const data = await res.json();
+        const sel = $("executionModeSelect");
+        if (sel) sel.value = data.mode;
+      }
+    } catch(e) {}
+  })();
+
+  // Project select change
+  $("projectSelect")?.addEventListener("change", async (event) => {
+    state.project = event.target.value;
+    state.currentFile = null;
+    state.openFiles = [];
+    
+    if (editor) editor.setValue("# Select or create a file to start coding.");
+    renderEditorTabs();
+    
+    await fetchWorkspaceFiles();
+    loadGitCheckpoints();
+    loadProjectRequirements();
+    log(`[ok] Switched workspace to project: ${state.project || 'Default Workspace'}`);
+  });
+
+  // Create Project
+  $("newProjectBtn")?.addEventListener("click", async () => {
+    const name = prompt("Enter new project folder name (e.g. Jarvis):");
+    if (!name) return;
+    try {
+      const res = await fetch("/api/workspace/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name })
+      });
+      if (res.ok) {
+        state.project = name;
+        await fetchProjects();
+        const sel = $("projectSelect");
+        if (sel) {
+          sel.value = name;
+          sel.dispatchEvent(new Event("change"));
+        }
+      }
+    } catch(e) {
+      alert("Failed to create project: " + e.message);
+    }
+  });
+
+  // Import Project
+  $("importProjectBtn")?.addEventListener("click", async () => {
+    const name = prompt("Enter project directory folder name (e.g. Jarvis):");
+    if (!name) return;
+    const path = prompt("Enter absolute path to the local project directory to import (e.g. C:/my-projects/Jarvis):");
+    if (!path) return;
+    try {
+      setStatus("Importing project", true);
+      const res = await fetch("/api/workspace/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, source_path: path })
+      });
+      if (res.ok) {
+        state.project = name;
+        await fetchProjects();
+        const sel = $("projectSelect");
+        if (sel) {
+          sel.value = name;
+          sel.dispatchEvent(new Event("change"));
+        }
+      } else {
+        throw new Error(await res.text());
+      }
+    } catch(e) {
+      alert("Failed to import project: " + e.message);
+    } finally {
+      setStatus("Standby", false);
+    }
+  });
+
+  // Run telemetry once initially
+  pollSystemMetrics();
+  pollRepositoryStatus();
+  pollTaskQueue();
+  fetchProjects();
+
+  // Run loops
+  window.setInterval(pollSystemMetrics, 3000);
+  window.setInterval(pollRepositoryStatus, 10000);
+  window.setInterval(pollTaskQueue, 4000);
+});
+
+async function pollSystemMetrics() {
+  try {
+    const res = await fetch("/api/system/monitor");
+    if (res.ok) {
+      const data = await res.json();
+      const gaugeCPU = $("gaugeCPU");
+      const barCPU = $("barCPU");
+      if (gaugeCPU) gaugeCPU.textContent = `${data.cpu}%`;
+      if (barCPU) barCPU.style.width = `${data.cpu}%`;
+
+      const gaugeRAM = $("gaugeRAM");
+      const barRAM = $("barRAM");
+      if (gaugeRAM) gaugeRAM.textContent = `${data.ram}%`;
+      if (barRAM) barRAM.style.width = `${data.ram}%`;
+
+      const gaugeVRAM = $("gaugeVRAM");
+      const barVRAM = $("barVRAM");
+      if (gaugeVRAM) gaugeVRAM.textContent = `${data.vram}%`;
+      if (barVRAM) barVRAM.style.width = `${data.vram}%`;
+
+      const gaugeGPU = $("gaugeGPU");
+      const barGPU = $("barGPU");
+      if (gaugeGPU) gaugeGPU.textContent = `${data.gpu}%`;
+      if (barGPU) barGPU.style.width = `${data.gpu}%`;
+    }
+  } catch (err) {
+    console.error("Telemetry fetch error:", err);
+  }
+}
+
+async function pollRepositoryStatus() {
+  try {
+    const res = await fetch("/api/repository/status");
+    if (res.ok) {
+      const data = await res.json();
+      const score = $("repoHealth");
+      if (score) score.textContent = `${data.health_score}%`;
+      const sym = $("repoSymbols");
+      if (sym) sym.textContent = data.symbols_count;
+      const files = $("repoFiles");
+      if (files) files.textContent = data.indexed_files;
+      const rag = $("repoRAG");
+      if (rag) rag.textContent = data.rag_status;
+      
+      const techList = $("repoTechList");
+      if (techList && data.tech_stack) {
+        techList.innerHTML = "";
+        data.tech_stack.forEach(tech => {
+          const item = document.createElement("div");
+          item.className = "log-line";
+          item.textContent = `• Framework: ${tech}`;
+          techList.appendChild(item);
+        });
+        const conv = document.createElement("div");
+        conv.className = "log-line";
+        conv.textContent = `• Conventions: ${data.conventions}`;
+        techList.appendChild(conv);
+      }
+    }
+  } catch (err) {
+    console.error("Repo status fetch error:", err);
+  }
+}
+
+async function pollTaskQueue() {
+  try {
+    const res = await fetch("/api/tasks");
+    if (res.ok) {
+      const data = await res.json();
+      const container = $("taskQueueContainer");
+      if (container && data.tasks) {
+        container.innerHTML = "";
+        if (data.tasks.length === 0) {
+          container.innerHTML = `<div class="log-line">No tasks running.</div>`;
+        } else {
+          data.tasks.slice(0, 5).forEach(t => {
+            const row = document.createElement("div");
+            row.className = "log-line";
+            let icon = "⚪";
+            if (t.status === "completed") icon = "✅";
+            else if (t.status === "in_progress") icon = "⚡";
+            else if (t.status === "failed") icon = "❌";
+            row.innerHTML = `<span style="color:var(--accent-cyan); font-weight:bold;">[ID ${t.id}]</span> ${icon} ${t.name}: ${t.status}`;
+            container.appendChild(row);
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Task list fetch error:", err);
+  }
+}
+
+window.renameResource = async function(path, event) {
+  if (event) event.stopPropagation();
+  const newName = prompt(`Enter new path for '${path}':`, path);
+  if (!newName || newName === path) return;
+  try {
+    const res = await fetch("/api/workspace/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ old_path: path, new_path: newName })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    await fetchWorkspaceFiles();
+    log(`[ok] Renamed ${path} to ${newName}`);
+  } catch(e) {
+    alert("Rename failed: " + e.message);
+  }
+};
+
+window.deleteResource = async function(path, event) {
+  if (event) event.stopPropagation();
+  if (confirm(`Are you sure you want to delete '${path}'?`)) {
+    try {
+      const res = await fetch("/api/workspace/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path })
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await fetchWorkspaceFiles();
+      log(`[ok] Deleted ${path}`);
+    } catch(e) {
+      alert("Delete failed: " + e.message);
+    }
+  }
+};

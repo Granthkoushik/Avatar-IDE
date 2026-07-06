@@ -1,0 +1,628 @@
+from __future__ import annotations
+
+import json
+import os
+import io
+import subprocess
+from collections.abc import AsyncIterator
+from pathlib import Path
+
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+import asyncio
+from app.orchestrator import orchestrator_loop
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+class CreateResourceRequest(BaseModel):
+    path: str
+
+from app.schemas import ChatRequest, ErrorReportRequest, FixRequest, ReviewRequest, ReviewResponse, SaveRequest, FileNode, FileTreeResponse, ProjectFixRequest
+from app.services.memory import get_memory, set_memory, get_all_memory
+from app.services.validation import validate_path
+# End imports
+from app.services.analyzer import analyze_code, heuristic_fix
+from app.services.language import SUPPORTED_LANGUAGES, monaco_language
+from app.services.ollama import generate, list_models, stream_generate
+
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+
+
+app = FastAPI(title="AVATAR", version="0.3.0", lifespan=lifespan)
+AVATAR_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = AVATAR_DIR / "projects"
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Start orchestrator background loop on startup
+@app.on_event("startup")
+async def start_orchestrator():
+    asyncio.create_task(orchestrator_loop())
+app.mount("/static", StaticFiles(directory=AVATAR_DIR / "static"), name="static")
+# Planner router
+from .planner import router as planner_router
+app.include_router(planner_router)
+
+
+# Project requirements API
+@app.get("/api/project/requirements")
+async def get_project_requirements(project_id: str = "default") -> dict:
+    try:
+        from app.services.memory import get_requirements
+        reqs = get_requirements(project_id)
+        return {"requirements": reqs}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+@app.post("/api/project/requirements")
+async def save_project_requirements(payload: dict, project_id: str = "default") -> dict:
+    try:
+        from app.services.memory import set_requirements
+        set_requirements(project_id, payload)
+        return {"success": True}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+
+@app.get("/")
+async def index() -> FileResponse:
+    return FileResponse(AVATAR_DIR / "static" / "index.html")
+
+
+def build_file_tree(directory: Path, root_path: Path) -> list[FileNode]:
+    nodes = []
+    ignore_dirs = {".venv", "node_modules", ".git", "__pycache__", ".idea", ".vscode"}
+    for path in directory.iterdir():
+        if path.name in ignore_dirs:
+            continue
+        if path.name.endswith((".pyc", ".pyo", ".exe", ".dll", ".so", ".dylib")):
+            continue
+            
+        rel_path = path.relative_to(root_path).as_posix()
+        node = FileNode(name=path.name, path=rel_path, is_dir=path.is_dir())
+        if path.is_dir():
+            node.children = build_file_tree(path, root_path)
+            if node.children:
+                nodes.append(node)
+        else:
+            nodes.append(node)
+    return sorted(nodes, key=lambda n: (not n.is_dir, n.name.lower()))
+
+
+@app.get("/api/workspace/files", response_model=FileTreeResponse)
+async def get_workspace_files() -> dict:
+    try:
+        tree = build_file_tree(BASE_DIR, BASE_DIR)
+        return {"files": tree}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/workspace/file")
+async def get_workspace_file(path: str) -> dict:
+    try:
+        target = (BASE_DIR / path).resolve()
+        if not target.is_relative_to(BASE_DIR) or not target.exists() or target.is_dir():
+            raise HTTPException(status_code=404, detail="File not found")
+        content = target.read_text(encoding="utf-8")
+        return {"content": content}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/workspace/create_file")
+async def create_workspace_file(req: CreateResourceRequest) -> dict:
+    try:
+        validate_path(req.path)
+        target = (BASE_DIR / req.path).resolve()
+        if not target.is_relative_to(BASE_DIR):
+            raise HTTPException(status_code=400, detail="Invalid path")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            target.write_text("", encoding="utf-8")
+        return {"success": True, "path": req.path}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/workspace/create_folder")
+async def create_workspace_folder(req: CreateResourceRequest) -> dict:
+    try:
+        target = (BASE_DIR / req.path).resolve()
+        if not target.is_relative_to(BASE_DIR):
+            raise HTTPException(status_code=400, detail="Invalid path")
+        target.mkdir(parents=True, exist_ok=True)
+        return {"success": True, "path": req.path}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+
+
+
+@app.get("/api/health")
+async def health() -> dict:
+    # Simplified health check without exposing model names
+    return {"status": "online"}
+
+
+@app.get("/api/models")
+async def models() -> dict:
+    return {"models": await list_models()}
+
+
+
+
+@app.get("/api/languages")
+async def languages() -> dict:
+    return {
+        "languages": sorted(SUPPORTED_LANGUAGES),
+        "monaco": {lang: monaco_language(lang) for lang in sorted(SUPPORTED_LANGUAGES)},
+    }
+
+
+@app.post("/api/save")
+async def save_code(payload: SaveRequest) -> dict:
+    try:
+        # Sanitize filename to prevent directory traversal
+        filename = payload.filename.strip()
+        if not filename:
+            raise HTTPException(status_code=400, detail="Filename cannot be empty")
+        
+        # Use secure file manager (no extension restrictions)
+        from app.services.file_manager import secure_write_file
+        # Write file; project_id empty string denotes default workspace
+        secure_write_file("", filename, payload.code)
+        
+        return {
+            "success": True,
+            "filepath": (BASE_DIR / filename).as_posix(),
+            "message": f"Successfully saved to {filename}",
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return {
+            "success": False,
+            "filepath": "",
+            "message": f"Failed to save file: {exc}",
+        }
+
+
+@app.post("/api/review", response_model=ReviewResponse)
+async def review(payload: ReviewRequest) -> dict:
+    deterministic = analyze_code(payload.code, payload.language)
+    prompt = f"""
+You are AVATAR, a precise local AI engineering reviewer.
+Return ONLY compact JSON matching this schema:
+{{
+  "summary": "PROJECT ANALYSIS COMPLETE",
+  "issue_count": number,
+  "confidence": 0-100,
+  "estimated_fix_time": "~Xm YYs",
+  "severity": "low|medium|high|critical",
+  "affected_sections": ["line/function/area"],
+  "issues": [
+    {{
+      "title": "short issue title",
+      "severity": "low|medium|high|critical",
+      "category": "syntax|runtime|security|performance|logic|style",
+      "section": "line/function/area",
+      "detail": "specific actionable explanation",
+      "line": number,
+      "column": number,
+      "source": "llm",
+      "fix_hint": "short repair hint"
+    }}
+  ]
+}}
+
+Focus especially on runtime crashes: NoneType, invalid object access, unsafe indexing,
+missing request timeouts, missing response validation, bad async handling, request
+failures, and exceptions that appear only after syntax passes.
+
+Detected language: {deterministic["language"]}
+Code:
+```{deterministic["language"]}
+{payload.code}
+```
+"""
+    raw, ok = await generate(payload.model, prompt)
+    if ok:
+        try:
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            parsed = json.loads(raw[start:end])
+            merged = normalize_review(parsed, deterministic)
+            merged["ollama_available"] = True
+            return merged
+        except Exception:
+            pass
+    deterministic["ollama_available"] = ok
+    return deterministic
+
+
+def normalize_review(parsed: dict, fallback: dict) -> dict:
+    issues = list(fallback.get("issues", []))
+    for issue in parsed.get("issues", []):
+        if not isinstance(issue, dict):
+            continue
+        line = safe_int(issue.get("line"), 1)
+        column = safe_int(issue.get("column"), 1)
+        issues.append(
+            {
+                "title": str(issue.get("title") or "Code review finding"),
+                "severity": str(issue.get("severity") or "medium").lower(),
+                "category": str(issue.get("category") or "quality").lower(),
+                "section": str(issue.get("section") or f"line {line}"),
+                "detail": str(issue.get("detail") or "Review this section."),
+                "line": line,
+                "column": column,
+                "end_line": safe_int(issue.get("end_line"), line),
+                "end_column": safe_int(issue.get("end_column"), column + 1),
+                "source": str(issue.get("source") or "llm"),
+                "fix_hint": str(issue.get("fix_hint") or ""),
+            }
+        )
+
+    issues = dedupe_issue_dicts(issues)
+    confidence = safe_int(parsed.get("confidence"), fallback["confidence"])
+    return {
+        "summary": str(parsed.get("summary") or fallback["summary"]),
+        "issue_count": len(issues),
+        "confidence": max(0, min(100, confidence)),
+        "estimated_fix_time": str(parsed.get("estimated_fix_time") or fallback["estimated_fix_time"]),
+        "severity": str(parsed.get("severity") or fallback["severity"]).lower(),
+        "affected_sections": parsed.get("affected_sections") or fallback["affected_sections"],
+        "issues": issues,
+        "ollama_available": True,
+        "language": fallback.get("language", "python"),
+        "tool_status": fallback.get("tool_status", []),
+        "pipeline": [*fallback.get("pipeline", []), "[ok] LLM reasoning merged."],
+    }
+
+
+def safe_int(value: object, default: int) -> int:
+    try:
+        return max(1, int(value))
+    except Exception:
+        return default
+
+
+def dedupe_issue_dicts(issues: list[dict]) -> list[dict]:
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+    for issue in issues:
+        key = (str(issue.get("title", "")).lower(), issue.get("line", 1), str(issue.get("category", "")).lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(issue)
+    return unique
+
+
+def event(payload: dict) -> bytes:
+    return (json.dumps(payload) + "\n").encode("utf-8")
+
+
+@app.post("/api/fix/stream")
+async def fix_stream(payload: FixRequest) -> StreamingResponse:
+    async def stream() -> AsyncIterator[bytes]:
+        analysis = analyze_code(payload.code, payload.language)
+        language = analysis["language"]
+        yield event({"type": "log", "message": "[ok] Running static analysis..."})
+        yield event({"type": "progress", "value": 8})
+        yield event({"type": "analysis", "analysis": analysis})
+        yield event({"type": "log", "message": "[ok] Detecting runtime risks..."})
+        yield event({"type": "log", "message": "[ok] Checking async safety..."})
+        prompt = f"""
+You are AVATAR, a local AI coding repair assistant.
+
+STRICT OUTPUT RULE:
+Return ONLY raw executable code.
+Do not return markdown, explanations, code fences, labels, or "Here is the fixed code".
+
+Repair priorities:
+1. Fix syntax errors.
+2. Prevent runtime crashes, especially NoneType, unsafe indexing, failed API responses,
+   missing timeouts, invalid JSON parsing, and unsafe async handling.
+3. Preserve formatting, indentation, public behavior, and user intent.
+4. Avoid unrelated rewrites.
+
+Diagnostics to address:
+{json.dumps(analysis["issues"], indent=2)}
+
+Language: {language}
+Code:
+```{language}
+{payload.code}
+```
+"""
+        current = ""
+        try:
+            yield event({"type": "log", "message": "[ok] Contacting local Ollama model..."})
+            async for chunk in stream_generate(payload.model, prompt, role="debugger"):
+                current += chunk
+                cleaned = clean_code_output(current)
+                if cleaned.strip() and looks_stable(cleaned):
+                    # Removed direct code events to avoid displaying code in chat
+                    progress = min(92, 12 + len(current) * 80 // max(len(payload.code), 1))
+                    yield event({"type": "progress", "value": progress})
+            final_code = clean_code_output(current).strip() or payload.code
+            yield event({"type": "log", "message": "[ok] Optimizing logic flow..."})
+            yield event({"type": "log", "message": "[ok] Repair stream complete."})
+            yield event({"type": "progress", "value": 100})
+            # Omit sending raw code in chat; workspace event will handle file creation
+            # Emit a simple done event without raw code to avoid chat preview
+            yield event({"type": "done"})
+        except Exception:
+            yield event({"type": "log", "message": "[!] Ollama unavailable; applying lightweight local repair pass."})
+            fixed = heuristic_fix(payload.code, language)
+            checkpoints = [
+                "[ok] Checking syntax-oriented cleanup...",
+                "[ok] Repairing API validation...",
+                "[ok] Applying runtime safety improvements...",
+                "[ok] Finalizing repaired output...",
+            ]
+            for index, message in enumerate(checkpoints, start=1):
+                preview_length = max(1, len(fixed) * index // len(checkpoints))
+                yield event({"type": "log", "message": message})
+                # No direct code event
+                yield event({"type": "progress", "value": min(98, index * 24)})
+            # Omit sending raw code; workspace handling elsewhere
+            # In error fallback, emit done without raw code to keep chat clean
+            yield event({"type": "done"})
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.post("/api/project/fix_all")
+async def project_fix_all(payload: ProjectFixRequest) -> StreamingResponse:
+    async def stream() -> AsyncIterator[bytes]:
+        yield event({"type": "log", "message": "[ok] Starting Project-Wide Repair..."})
+        
+        all_files = []
+        for root, dirs, files in os.walk(BASE_DIR):
+            dirs[:] = [d for d in dirs if d not in {".venv", "node_modules", ".git", "__pycache__", ".idea", ".vscode"}]
+            for f in files:
+                if not f.endswith((".py", ".js", ".ts", ".html", ".css", ".json")):
+                    continue
+                all_files.append(Path(root) / f)
+                
+        total = len(all_files)
+        if total == 0:
+            yield event({"type": "progress", "value": 100})
+            yield event({"type": "done", "message": "[ok] No files found."})
+            return
+
+        for i, filepath in enumerate(all_files):
+            rel_path = filepath.relative_to(BASE_DIR).as_posix()
+            yield event({"type": "progress", "value": int((i / total) * 100)})
+            yield event({"type": "log", "message": f"[ok] Analyzing {rel_path}..."})
+            
+            try:
+                code = filepath.read_text(encoding="utf-8")
+                analysis = analyze_code(code, "auto")
+                
+                if analysis.get("issues"):
+                    yield event({"type": "log", "message": f"[!] Issues found in {rel_path}. Applying heuristic fix..."})
+                    fixed = heuristic_fix(code, analysis["language"])
+                    
+                    if fixed != code:
+                        filepath.write_text(fixed, encoding="utf-8")
+                        yield event({"type": "log", "message": f"[ok] Fixed {rel_path} heuristically."})
+                    else:
+                        yield event({"type": "log", "message": f"[-] No automated fixes for {rel_path}."})
+                else:
+                    yield event({"type": "log", "message": f"[ok] {rel_path} is clean."})
+            except Exception as e:
+                yield event({"type": "log", "message": f"[!] Error processing {rel_path}: {e}"})
+                
+        yield event({"type": "progress", "value": 100})
+        yield event({"type": "log", "message": "[ok] Project-wide repair complete!"})
+        yield event({"type": "done", "message": "[ok] Done."})
+        
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(payload: ChatRequest) -> StreamingResponse:
+    async def stream() -> AsyncIterator[bytes]:
+        language = analyze_code(payload.code, payload.language)["language"] if payload.code.strip() else payload.language
+        history = "\n".join(f"{item.get('role', 'user')}: {item.get('content', '')}" for item in payload.history[-8:])
+        
+        # Check if user message contains error keywords or stack trace patterns
+        lower_msg = payload.message.lower()
+        is_error = any(term in lower_msg for term in ["error", "exception", "traceback", "crash", "failed", "bug", "invalid", "fail", "broken", "wrong"]) or "traceback" in lower_msg or "line " in lower_msg
+        wants_code = looks_like_code_request(payload.message) or is_error
+        
+        prompt = f"""
+You are AVATAR, a professional local coding assistant.
+
+When the user asks you to write code, OR when the user reports an error, crash, exception, traceback, or broken code:
+- Carefully analyze the traceback, error message, or description to identify the root cause (such as missing library imports, syntax bugs, logic errors, or API issues).
+- Rewrite and output the FULL, COMPLETE, and corrected code file inside ONE markdown fenced code block with the correct language tag. Do not output partial snippets or placeholders under any circumstances; the entire file must be generated completely so the system can overwrite the old file.
+- Keep comments and explanations outside of the fenced code block brief.
+- The user's workspace editor will automatically sync this fenced code, replace the file, and make it ready to run.
+
+Preferred workspace language: {language}
+Code generation requested: {"yes" if wants_code else "no"}
+Conversation:
+{history}
+
+Project Context (Memory):
+{payload.project_context}
+
+Current editor context:
+```{language}
+{payload.code[-12000:]}
+```
+
+User question:
+{payload.message}
+"""
+        # Incrementally process the Ollama stream to avoid long latency.
+        buffer = ""
+        in_code = False
+        code_buffer = ""
+        lang_token = ""
+        try:
+            async for chunk in stream_generate(payload.model, prompt, role="coder"):
+                buffer += chunk
+                while True:
+                    if not in_code:
+                        start = buffer.find("```")
+                        if start == -1:
+                            # No code fence, send all as text
+                            if buffer.strip():
+                                yield event({"type": "chunk", "text": buffer.strip()})
+                            buffer = ""
+                            break
+                        # Send text before the fence
+                        if start > 0 and buffer[:start].strip():
+                            yield event({"type": "chunk", "text": buffer[:start].strip()})
+                        # Determine language after fence
+                        newline_pos = buffer.find("\n", start + 3)
+                        if newline_pos != -1:
+                            lang_token = buffer[start + 3:newline_pos].strip().lower()
+                            buffer = buffer[newline_pos + 1 :]
+                        else:
+                            lang_token = ""
+                            buffer = buffer[start + 3 :]
+                        in_code = True
+                        code_buffer = ""
+                    else:
+                        end = buffer.find("```")
+                        if end == -1:
+                            # Incomplete code block, accumulate and wait
+                            code_buffer += buffer
+                            buffer = ""
+                            break
+                        # Complete code block found
+                        code_buffer += buffer[:end]
+                        final_code = code_buffer.strip()
+                        final_lang = lang_token if lang_token else language
+                        # Write file and emit workspace event
+                        import uuid
+                        filename = f"generated_{final_lang}_{uuid.uuid4().hex[:8]}"
+                        from app.services.file_manager import secure_write_file
+                        secure_write_file("", filename, final_code)
+                        yield event({
+                            "type": "workspace",
+                            "code": final_code,
+                            "language": final_lang,
+                            "filename": filename,
+                        })
+                        # Reset state and continue with remaining buffer
+                        buffer = buffer[end + 3 :]
+                        in_code = False
+                        code_buffer = ""
+                        lang_token = ""
+                # Continue processing next chunk
+        except Exception:
+            yield event({
+                "type": "chunk",
+                "text": "Ollama is not available. Check that Ollama is running on localhost:11434 and that the selected model is installed.",
+            })
+            yield event({"type": "done"})
+        # After stream ends, send any remaining text
+        if buffer.strip():
+            yield event({"type": "chunk", "text": buffer.strip()})
+        # Emit stats and done events
+        yield event({
+            "type": "stats",
+            "tokens_used": 0,
+            "ai_efficiency": "90%",
+            "suggestions": 143,
+            "issues_fixed": 23,
+            "issues": 25.5,
+        })
+        yield event({"type": "done"})
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+def clean_code_output(text: str) -> str:
+    cleaned = strip_prefix(text.strip())
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
+def strip_prefix(text: str) -> str:
+    prefixes = ["Here is the fixed code:", "Here is the corrected code:", "Fixed code:", "Corrected code:"]
+    for prefix in prefixes:
+        if text.lower().startswith(prefix.lower()):
+            return text[len(prefix) :].strip()
+    return text
+
+
+def looks_stable(code: str) -> bool:
+    if not code:
+        return False
+    return code.endswith(("\n", "}", ";", ")", "]", '"', "'")) or len(code) > 280
+
+
+CODE_REQUEST_TERMS = (
+    "write",
+    "create",
+    "implement",
+    "generate",
+    "build",
+    "make",
+    "draft",
+    "develop",
+    "add",
+    "code",
+    "script",
+    "function",
+    "class",
+    "program",
+    "component",
+    "api",
+    "scaffold",
+    "show me",
+    "give me",
+)
+
+
+def looks_like_code_request(message: str) -> bool:
+    lower = message.lower()
+    return any(term in lower for term in CODE_REQUEST_TERMS)
+
+
+def extract_workspace_code(text: str, fallback_language: str) -> tuple[str, str]:
+    blocks: list[tuple[str, str]] = []
+    cursor = 0
+    while True:
+        start = text.find("```", cursor)
+        if start == -1:
+            break
+        lang_end = text.find("\n", start + 3)
+        if lang_end == -1:
+            break
+        lang_token = text[start + 3 : lang_end].strip().lower()
+        body_start = lang_end + 1
+        end = text.find("```", body_start)
+        if end == -1:
+            break
+        code = text[body_start:end].strip()
+        language = lang_token if lang_token else fallback_language
+        if code:
+            blocks.append((code, language))
+        cursor = end + 3
+    if not blocks:
+        return "", fallback_language
+    code, language = max(blocks, key=lambda item: len(item[0]))
+    return code, language

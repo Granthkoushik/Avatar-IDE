@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AVATAR // Study Planner</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Orbitron:wght@500;700;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <style>
+      :root {
+        --bg-color: #080c14;
+        --card-bg: rgba(16, 22, 38, 0.7);
+        --text-color: #e2e8f0;
+        --text-dim: #94a3b8;
+        --border-color: rgba(0, 242, 254, 0.2);
+        --accent-cyan: #00f2fe;
+        --accent-purple: #8b5cf6;
+        --accent-gold: #f39c12;
+      }
+      body {
+        margin: 0;
+        padding: 0;
+        background-color: var(--bg-color);
+        color: var(--text-color);
+        font-family: 'Inter', sans-serif;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        min-height: 100vh;
+        overflow-x: hidden;
+      }
+      header {
+        width: 100%;
+        max-width: 800px;
+        padding: 40px 20px 20px 20px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        box-sizing: border-box;
+      }
+      h1 {
+        font-family: 'Orbitron', sans-serif;
+        color: var(--accent-cyan);
+        text-shadow: 0 0 10px rgba(0, 242, 254, 0.4);
+        margin: 0;
+        font-size: 24px;
+        letter-spacing: 2px;
+      }
+      .back-link {
+        color: var(--text-dim);
+        text-decoration: none;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 14px;
+        border: 1px solid var(--border-color);
+        padding: 8px 16px;
+        border-radius: 4px;
+        transition: all 0.3s ease;
+        background: rgba(0, 242, 254, 0.05);
+      }
+      .back-link:hover {
+        color: var(--accent-cyan);
+        border-color: var(--accent-cyan);
+        box-shadow: 0 0 10px rgba(0, 242, 254, 0.2);
+        background: rgba(0, 242, 254, 0.1);
+      }
+      .planner-container {
+        width: 100%;
+        max-width: 800px;
+        padding: 0 20px 40px 20px;
+        box-sizing: border-box;
+      }
+      .input-card {
+        background: var(--card-bg);
+        border: 1px solid var(--border-color);
+        padding: 24px;
+        border-radius: 12px;
+        display: flex;
+        gap: 16px;
+        align-items: center;
+        margin-bottom: 24px;
+        backdrop-filter: blur(10px);
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+      }
+      input[type="text"], input[type="date"] {
+        background: rgba(8, 12, 20, 0.8);
+        border: 1px solid var(--border-color);
+        color: var(--text-color);
+        padding: 12px 16px;
+        border-radius: 6px;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 14px;
+        outline: none;
+        transition: border-color 0.3s;
+      }
+      input[type="text"] {
+        flex: 1;
+      }
+      input[type="text"]:focus, input[type="date"]:focus {
+        border-color: var(--accent-cyan);
+        box-shadow: 0 0 8px rgba(0, 242, 254, 0.2);
+      }
+      button {
+        background: linear-gradient(135deg, var(--accent-cyan), #4facfe);
+        color: #080c14;
+        border: none;
+        padding: 12px 24px;
+        border-radius: 6px;
+        font-family: 'Orbitron', sans-serif;
+        font-weight: 700;
+        font-size: 14px;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 0 10px rgba(0, 242, 254, 0.3);
+      }
+      button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 0 20px rgba(0, 242, 254, 0.5);
+      }
+      .task-card {
+        background: var(--card-bg);
+        border: 1px solid var(--border-color);
+        border-radius: 12px;
+        padding: 12px;
+        backdrop-filter: blur(10px);
+      }
+      ul {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+      }
+      .task-item {
+        display: flex;
+        align-items: center;
+        padding: 16px;
+        border-bottom: 1px solid rgba(0, 242, 254, 0.1);
+        gap: 16px;
+        transition: all 0.2s;
+      }
+      .task-item:last-child {
+        border-bottom: none;
+      }
+      .task-item:hover {
+        background: rgba(0, 242, 254, 0.02);
+      }
+      .task-complete {
+        width: 18px;
+        height: 18px;
+        cursor: pointer;
+        accent-color: var(--accent-cyan);
+      }
+      .task-title {
+        flex: 1;
+        font-size: 15px;
+        transition: all 0.3s;
+      }
+      .task-title.done {
+        color: var(--text-dim);
+        text-decoration: line-through;
+      }
+      .task-due {
+        background: transparent;
+        border: 1px solid transparent;
+        color: var(--accent-gold);
+        font-size: 13px;
+        padding: 4px 8px;
+      }
+      .task-delete {
+        background: transparent;
+        color: #ef4444;
+        border: none;
+        cursor: pointer;
+        padding: 8px;
+        border-radius: 4px;
+        box-shadow: none;
+        transition: background 0.3s;
+      }
+      .task-delete:hover {
+        background: rgba(239, 68, 68, 0.1);
+        transform: none;
+        box-shadow: none;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>AVATAR // TASK PLANNER</h1>
+      <a href="/" class="back-link">&lt; BACK TO IDE</a>
+    </header>
+
+    <div class="planner-container">
+      <div class="input-card">
+        <input type="text" id="titleInput" placeholder="Add a new milestone/task..." />
+        <input type="date" id="dueInput" />
+        <button id="addTaskBtn" type="button">ADD TASK</button>
+      </div>
+
+      <div class="task-card">
+        <ul id="taskList">
+          <!-- Loaded dynamically -->
+        </ul>
+      </div>
+    </div>
+
+    <script src="/static/study_planner.js"></script>
+  </body>
+</html>

@@ -1,0 +1,408 @@
+# config/system.yaml
+# AVATAR Central Operating Configuration File
+# This file governs task schedules, models registration, routing, resources management, and security.
+
+# ========================================
+# SYSTEM CONFIGURATION
+# ========================================
+system:
+  project_name: "AVATAR"
+  version: "1.0.0"
+  environment: "production"
+  debug_mode: false
+  logging:
+    level: "INFO"
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  workspace:
+    root_dir: "./projects"
+    max_parallel_tasks: 2
+  retry_policy:
+    max_attempts: 5
+    backoff_factor: 2.0
+  timeout_policy:
+    default_request_timeout_seconds: 90
+    test_execution_timeout_seconds: 60
+  task_queue:
+    backend: "sqlite"
+    poll_interval_seconds: 3
+  checkpoint_settings:
+    enabled: true
+    provider: "git"
+    message_prefix: "checkpoint: "
+
+# ========================================
+# AI MODELS REGISTRY
+# ========================================
+ai_models:
+  hermes_3:
+    model_name: "hermes3:latest"
+    purpose: "Planning, System Design, Requirements Analysis, Prompt Engineering"
+    priority: 1
+    strengths: ["Instruction following", "System architecture", "Task planning"]
+    weaknesses: ["Deep algorithmic coding", "Low-resource VRAM execution"]
+    max_context: 32768
+    temperature: 0.2
+    top_p: 0.9
+    top_k: 40
+    repeat_penalty: 1.1
+    maximum_tokens: 4096
+    timeout: 60
+    supports_streaming: true
+    supports_vision: false
+    supports_function_calling: true
+    supports_structured_output: true
+    supports_json: true
+    supports_tool_use: true
+    supports_code: false
+    supports_reasoning: false
+    supports_review: false
+    supports_planning: true
+    supports_embeddings: false
+    cloud_or_local: "local"
+    fallback_model: "qwen2.5-coder:7b"
+    automatic_escalation_rules:
+      - condition: "context_overflow"
+        escalate_to: "nemotron-3-ultra:cloud"
+    current_hardware_recommendation: "8GB+ VRAM GPU"
+    default_tasks: ["plan", "architecture", "docs"]
+
+  qwen25_coder:
+    model_name: "qwen2.5-coder:14b"
+    purpose: "Primary Software Engineering, Code Generation"
+    priority: 1
+    strengths: ["Code writing", "Syntax logic", "Multi-language idioms"]
+    weaknesses: ["High-level task planning", "Self-critique review"]
+    max_context: 16384
+    temperature: 0.1
+    top_p: 0.95
+    top_k: 50
+    repeat_penalty: 1.05
+    maximum_tokens: 4096
+    timeout: 90
+    supports_streaming: true
+    supports_vision: false
+    supports_function_calling: false
+    supports_structured_output: false
+    supports_json: false
+    supports_tool_use: false
+    supports_code: true
+    supports_reasoning: false
+    supports_review: false
+    supports_planning: false
+    supports_embeddings: false
+    cloud_or_local: "local"
+    fallback_model: "qwen2.5-coder:7b"
+    automatic_escalation_rules:
+      - condition: "timeout"
+        escalate_to: "nemotron-3-ultra:cloud"
+    current_hardware_recommendation: "12GB+ VRAM GPU"
+    default_tasks: ["codegen"]
+
+  qwen3_reviewer:
+    model_name: "qwen3:8b"
+    purpose: "Repository Intelligence, Code Review, Static Analysis, Security Auditing"
+    priority: 2
+    strengths: ["Static checks", "Vulnerability auditing", "Code reviews"]
+    weaknesses: ["Generation of brand new architectures"]
+    max_context: 8192
+    temperature: 0.1
+    top_p: 0.9
+    top_k: 40
+    repeat_penalty: 1.1
+    maximum_tokens: 2048
+    timeout: 45
+    supports_streaming: true
+    supports_vision: false
+    supports_function_calling: true
+    supports_structured_output: true
+    supports_json: true
+    supports_tool_use: true
+    supports_code: false
+    supports_reasoning: false
+    supports_review: true
+    supports_planning: false
+    supports_embeddings: false
+    cloud_or_local: "local"
+    fallback_model: "llama3:latest"
+    automatic_escalation_rules: []
+    current_hardware_recommendation: "6GB+ VRAM GPU"
+    default_tasks: ["analyzer", "security", "review"]
+
+  deepseek_r1:
+    model_name: "deepseek-r1:8b"
+    purpose: "Reasoning Engineer, Performance Tuning, Root-Cause Debugging"
+    priority: 1
+    strengths: ["Logical thinking", "Traceback diagnostics", "Algorithm design"]
+    weaknesses: ["Fast response times"]
+    max_context: 16384
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 50
+    repeat_penalty: 1.1
+    maximum_tokens: 8192
+    timeout: 120
+    supports_streaming: true
+    supports_vision: false
+    supports_function_calling: false
+    supports_structured_output: false
+    supports_json: false
+    supports_tool_use: false
+    supports_code: true
+    supports_reasoning: true
+    supports_review: false
+    supports_planning: false
+    supports_embeddings: false
+    cloud_or_local: "local"
+    fallback_model: "qwen2.5-coder:14b"
+    automatic_escalation_rules: []
+    current_hardware_recommendation: "8GB+ VRAM GPU"
+    default_tasks: ["debug"]
+
+  nemotron_ultra:
+    model_name: "nemotron-3-ultra:cloud"
+    purpose: "Large Scale Refactoring, High-Context Codebase Editing"
+    priority: 3
+    strengths: ["Cloud capacity", "Extremely large context window", "Multi-file changes"]
+    weaknesses: ["High latency", "Requires internet access"]
+    max_context: 131072
+    temperature: 0.3
+    top_p: 0.9
+    top_k: 40
+    repeat_penalty: 1.0
+    maximum_tokens: 8192
+    timeout: 180
+    supports_streaming: true
+    supports_vision: false
+    supports_function_calling: true
+    supports_structured_output: true
+    supports_json: true
+    supports_tool_use: true
+    supports_code: true
+    supports_reasoning: false
+    supports_review: true
+    supports_planning: true
+    supports_embeddings: false
+    cloud_or_local: "cloud"
+    fallback_model: "deepseek-r1:8b"
+    automatic_escalation_rules: []
+    current_hardware_recommendation: "N/A (Cloud-hosted)"
+    default_tasks: []
+
+  bge_m3:
+    model_name: "bge-m3:latest"
+    purpose: "Embeddings, Indexing, Vector Search"
+    priority: 1
+    strengths: ["Multi-lingual retrieval", "Dense vectors", "Sparse vectors"]
+    weaknesses: ["Reasoning", "Code output"]
+    max_context: 8192
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 1
+    repeat_penalty: 1.0
+    maximum_tokens: 512
+    timeout: 10
+    supports_streaming: false
+    supports_vision: false
+    supports_function_calling: false
+    supports_structured_output: false
+    supports_json: false
+    supports_tool_use: false
+    supports_code: false
+    supports_reasoning: false
+    supports_review: false
+    supports_planning: false
+    supports_embeddings: true
+    cloud_or_local: "local"
+    fallback_model: "nomic-embed-text"
+    automatic_escalation_rules: []
+    current_hardware_recommendation: "4GB+ RAM CPU/GPU"
+    default_tasks: ["embeddings"]
+
+# ========================================
+# MODEL ROUTING
+# ========================================
+model_routing:
+  planner: "hermes_3"
+  repository_analysis: "qwen3_reviewer"
+  code_generation: "qwen25_coder"
+  code_review: "qwen3_reviewer"
+  debugger: "deepseek_r1"
+  documentation: "hermes_3"
+  security: "qwen3_reviewer"
+  performance: "deepseek_r1"
+  testing: "hermes_3"
+  git: "local_cli"
+  memory: "sqlite_local"
+  rag: "bge_m3"
+  embeddings: "bge_m3"
+  reasoning: "deepseek_r1"
+  frontend: "qwen25_coder"
+  backend: "qwen25_coder"
+  database: "qwen25_coder"
+  devops: "hermes_3"
+  plugin_system: "hermes_3"
+  workspace: "local_fs"
+  terminal: "local_cli"
+
+# ========================================
+# RESOURCE MANAGEMENT
+# ========================================
+resource_management:
+  hardware:
+    max_ram_usage_gb: 16
+    max_vram_usage_gb: 4
+    max_cpu_threads: 4
+    gpu_layers: 24
+  concurrency:
+    max_concurrent_models: 1
+    max_concurrent_tasks: 1
+  caching:
+    unload_policy: "least_recently_used"
+    model_cache_enabled: true
+    prompt_cache_enabled: true
+    kv_cache_enabled: true
+    embedding_cache_enabled: true
+    repository_cache_enabled: true
+
+# ========================================
+# RETRIEVAL-AUGMENTED GENERATION (RAG)
+# ========================================
+rag:
+  embedding_model: "bge_m3"
+  chunk_size: 500
+  chunk_overlap: 50
+  similarity_threshold: 0.7
+  max_retrieved_chunks: 5
+  vector_store: "sqlite_vec"
+  repository_index:
+    enabled: true
+    incremental_indexing: true
+  context_ranking: "cross_encoder"
+
+# ========================================
+# MEMORY
+# ========================================
+memory:
+  conversation_memory:
+    history_limit: 8
+    retention_policy: "session"
+  repository_memory:
+    schema_version: "1.0"
+    retention_policy: "permanent"
+  architecture_memory:
+    schema_version: "1.0"
+    retention_policy: "permanent"
+  decision_memory:
+    schema_version: "1.0"
+    retention_policy: "permanent"
+  task_memory:
+    database_file: "tasks.db"
+    retention_policy: "permanent"
+  bug_memory:
+    database_file: "project_memory.db"
+    retention_policy: "permanent"
+  user_preference_memory:
+    retention_policy: "permanent"
+
+# ========================================
+# WORKSPACE MANAGEMENT
+# ========================================
+workspace:
+  editor:
+    auto_save: true
+    auto_recovery: true
+    undo_history_limit: 50
+  watchers:
+    file_watching_enabled: true
+    checkpoint_frequency_minutes: 10
+  isolation:
+    workspace_isolation_enabled: true
+    filesystem_restrictions: ["./projects/"]
+  terminal_integration:
+    enabled: true
+    default_shell: "powershell"
+
+# ========================================
+# SECURITY
+# ========================================
+security:
+  sandbox:
+    enabled: true
+    blocked_dirs: ["C:/Windows", "C:/Users/grant/.gemini/config"]
+  protections:
+    prompt_injection_protection_enabled: true
+    command_validation_enabled: true
+    secret_detection_enabled: true
+    environment_protection_enabled: true
+  plugins:
+    plugin_isolation_enabled: true
+
+# ========================================
+# TESTING POLICIES
+# ========================================
+testing:
+  execution:
+    run_unit_tests: true
+    run_integration_tests: true
+    run_ui_tests: false
+    run_api_tests: true
+  quality:
+    run_static_analysis: true
+    run_linting: true
+    run_formatting: true
+    run_build: true
+  error_handling:
+    retry_failed_tests: true
+    max_retries: 3
+
+# ========================================
+# VERIFICATION PASSES
+# ========================================
+verification:
+  passes:
+    repository_verification: true
+    dependency_verification: true
+    import_verification: true
+    api_verification: true
+    ui_verification: false
+    performance_verification: true
+    security_verification: true
+    documentation_verification: true
+    git_verification: true
+
+# ========================================
+# PROMPT LOCATIONS & LOCALS
+# ========================================
+prompts:
+  configuration:
+    prompt_locations: "./app/prompts"
+    dynamic_prompt_loading: true
+  agent_prompt_paths:
+    planner: "./app/prompts/planner.yaml"
+    coder: "./app/prompts/coder.yaml"
+    reviewer: "./app/prompts/reviewer.yaml"
+    debugger: "./app/prompts/debugger.yaml"
+
+# ========================================
+# LOGGING
+# ========================================
+logging:
+  targets:
+    llm_logs_enabled: true
+    terminal_logs_enabled: true
+    workspace_logs_enabled: true
+    api_logs_enabled: true
+    git_logs_enabled: true
+    performance_logs_enabled: true
+  rotation:
+    max_file_size_mb: 10
+    backup_count: 5
+
+# ========================================
+# FUTURE EXPANSION
+# ========================================
+future_expansion:
+  extensibility:
+    allows_dynamic_models: true
+    allows_dynamic_plugins: true
+    allows_dynamic_workflows: true
